@@ -439,6 +439,9 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         rope_scale: Tuple[float, float, float] = (2.0, 1.0, 1.0),
         concat_padding_mask: bool = True,
         extra_pos_embed_type: Optional[str] = "learnable",
+        use_crossattn_projection: bool = False,
+        crossattn_proj_in_channels: int = 1024,
+        crossattn_emb_channels: int = 1024,
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
@@ -485,6 +488,12 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             hidden_size, patch_size[0] * patch_size[1] * patch_size[2] * out_channels, bias=False
         )
 
+        if use_crossattn_projection:
+            self.crossattn_proj = nn.Sequential(
+                nn.Linear(crossattn_proj_in_channels, crossattn_emb_channels, bias=True),
+                nn.GELU(),
+            )
+
         self.gradient_checkpointing = False
 
     def forward(
@@ -497,6 +506,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         condition_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        crossattn_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 

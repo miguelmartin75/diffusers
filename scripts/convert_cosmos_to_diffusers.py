@@ -1,3 +1,46 @@
+"""
+# Cosmos 2 Predict
+
+Download checkpoint
+```bash
+hf download nvidia/Cosmos-Predict2-2B-Text2Image 
+```
+
+convert checkpoint
+```bash
+transformer_ckpt_path=~/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2-2B-Text2Image/snapshots/acdb5fde992a73ef0355f287977d002cbfd127e0/model.pt
+
+python scripts/convert_cosmos_to_diffusers.py \
+    --transformer_ckpt_path $transformer_ckpt_path \
+    --transformer_type Cosmos-2.0-Diffusion-2B-Text2Image \
+    --vae_type wan2.1 \
+    --output_path outputs/chkpts/ \
+    --save_pipeline
+```
+
+# Cosmos 2.5 Predict
+
+Download checkpoint
+```bash
+hf download nvidia/Cosmos-Predict2.5-2B
+```
+
+Convert checkpoint
+```bash
+transformer_ckpt_path=~/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2.5-2B/snapshots/865baf084d4c9e850eac59a021277d5a9b9e8b63/base/pre-trained/d20b7120-df3e-4911-919d-db6e08bad31c_ema_bf16.pt
+
+python scripts/convert_cosmos_to_diffusers.py \
+    --transformer_type Cosmos-2.5-Predict-Base-2B \
+    --transformer_ckpt_path $transformer_ckpt_path \
+    --vae_type wan2.1 \
+    --text_encoder_path TODO \
+    --tokenizer_path TODO \
+    --output_path outputs/chkpts/ \
+    --save_pipeline
+```
+
+"""
+import sys
 import argparse
 import pathlib
 from typing import Any, Dict
@@ -233,6 +276,27 @@ TRANSFORMER_CONFIGS = {
         "concat_padding_mask": True,
         "extra_pos_embed_type": None,
     },
+    # TODO(migmartin); check these params
+    "Cosmos-2.5-Predict-Base-2B": {
+        "in_channels": 16 + 1,  # good
+        "out_channels": 16,  # good
+        "num_attention_heads": 16,  # good
+        "attention_head_dim": 128,  # good
+        "num_layers": 28,  # good
+        "mlp_ratio": 4.0,  # good
+        "text_embed_dim": 1024,
+        "adaln_lora_dim": 256,
+        "max_size": (128, 240, 240),  # good
+        "patch_size": (1, 2, 2),  # good
+        "rope_scale": (1.0, 3.0, 3.0),  # good
+        "concat_padding_mask": True,   # good
+        # NOTE: config has pos_emb_learnable: 'True' - but params are missing
+        # "extra_pos_embed_type": 'learnable', 
+        "extra_pos_embed_type": None,
+        "use_crossattn_projection": True,
+        "crossattn_proj_in_channels": 100352,
+        "crossattn_emb_channels": 1024,
+    },
 }
 
 VAE_KEYS_RENAME_DICT = {
@@ -334,6 +398,10 @@ def convert_transformer(transformer_type: str, ckpt_path: str, weights_only: boo
     elif "Cosmos-2.0" in transformer_type:
         TRANSFORMER_KEYS_RENAME_DICT = TRANSFORMER_KEYS_RENAME_DICT_COSMOS_2_0
         TRANSFORMER_SPECIAL_KEYS_REMAP = TRANSFORMER_SPECIAL_KEYS_REMAP_COSMOS_2_0
+    elif "Cosmos-2.5" in transformer_type:
+        # TODO(migmartin): update this
+        TRANSFORMER_KEYS_RENAME_DICT = TRANSFORMER_KEYS_RENAME_DICT_COSMOS_2_0
+        TRANSFORMER_SPECIAL_KEYS_REMAP = TRANSFORMER_SPECIAL_KEYS_REMAP_COSMOS_2_0
     else:
         assert False
 
@@ -347,13 +415,32 @@ def convert_transformer(transformer_type: str, ckpt_path: str, weights_only: boo
             new_key = new_key.removeprefix(PREFIX_KEY)
         for replace_key, rename_key in TRANSFORMER_KEYS_RENAME_DICT.items():
             new_key = new_key.replace(replace_key, rename_key)
-        update_state_dict_(original_state_dict, key, new_key)
+        print(key, "->", new_key, flush=True)
+        try:
+            update_state_dict_(original_state_dict, key, new_key)
+        except:
+            breakpoint()
 
     for key in list(original_state_dict.keys()):
         for special_key, handler_fn_inplace in TRANSFORMER_SPECIAL_KEYS_REMAP.items():
             if special_key not in key:
                 continue
             handler_fn_inplace(key, original_state_dict)
+
+    expected_keys = set(transformer.state_dict().keys())
+    mapped_keys = set(original_state_dict.keys())
+    missing_keys = expected_keys - mapped_keys
+    unexpected_keys = mapped_keys - expected_keys
+    if missing_keys:
+        print("missing keys", flush=True, file=sys.stderr)
+        for k in missing_keys:
+            print(k)
+        sys.exit(1)
+    if unexpected_keys:
+        print("unexpected_keys", flush=True, file=sys.stderr)
+        for k in unexpected_keys:
+            print(k)
+        sys.exit(2)
 
     transformer.load_state_dict(original_state_dict, strict=True, assign=True)
     return transformer
@@ -443,6 +530,22 @@ def save_pipeline_cosmos_2_0(args, transformer, vae):
     )
     pipe.save_pretrained(args.output_path, safe_serialization=True, max_shard_size="5GB")
 
+def save_pipeline_cosmos_2_5(args, transformer, vae):
+    # text_encoder = T5EncoderModel.from_pretrained(args.text_encoder_path, torch_dtype=torch.bfloat16)
+    # tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_path)
+
+    scheduler = FlowMatchEulerDiscreteScheduler(use_karras_sigmas=True)
+
+    pipe_cls = Cosmos2TextToImagePipeline if "Text2Image" in args.transformer_type else Cosmos2VideoToWorldPipeline
+    pipe = pipe_cls(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        transformer=transformer,
+        vae=vae,
+        scheduler=scheduler,
+        safety_checker=lambda *args, **kwargs: None,
+    )
+    pipe.save_pretrained(args.output_path, safe_serialization=True, max_shard_size="5GB")
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -451,7 +554,7 @@ def get_args():
         "--transformer_ckpt_path", type=str, default=None, help="Path to original transformer checkpoint"
     )
     parser.add_argument(
-        "--vae_type", type=str, default=None, choices=["none", *list(VAE_CONFIGS.keys())], help="Type of VAE"
+        "--vae_type", type=str, default="wan2.1", choices=["wan2.1", *list(VAE_CONFIGS.keys())], help="Type of VAE"
     )
     parser.add_argument("--text_encoder_path", type=str, default="google-t5/t5-11b")
     parser.add_argument("--tokenizer_path", type=str, default="google-t5/t5-11b")
@@ -490,10 +593,13 @@ if __name__ == "__main__":
     if args.vae_type is not None:
         if "Cosmos-1.0" in args.transformer_type:
             vae = convert_vae(args.vae_type)
-        else:
+        elif "Cosmos-2.0" in args.transformer_type or "Cosmos-2.5" in args.transformer_type:
             vae = AutoencoderKLWan.from_pretrained(
                 "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", torch_dtype=torch.float32
             )
+        else:
+            raise AssertionError(f"{args.transformer_type} not supported")
+
         if not args.save_pipeline:
             vae.save_pretrained(args.output_path, safe_serialization=True, max_shard_size="5GB")
 
@@ -502,5 +608,7 @@ if __name__ == "__main__":
             save_pipeline_cosmos_1_0(args, transformer, vae)
         elif "Cosmos-2.0" in args.transformer_type:
             save_pipeline_cosmos_2_0(args, transformer, vae)
+        elif "Cosmos-2.5" in args.transformer_type:
+            save_pipeline_cosmos_2_5(args, transformer, vae)
         else:
             assert False

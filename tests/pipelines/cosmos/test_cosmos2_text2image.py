@@ -37,7 +37,6 @@ from .cosmos_guardrail import DummyCosmosSafetyChecker
 
 enable_full_determinism()
 
-
 class Cosmos2TextToImagePipelineWrapper(Cosmos2TextToImagePipeline):
     @staticmethod
     def from_pretrained(*args, **kwargs):
