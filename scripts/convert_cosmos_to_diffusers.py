@@ -13,8 +13,10 @@ transformer_ckpt_path=~/.cache/huggingface/hub/models--nvidia--Cosmos-Predict2-2
 python scripts/convert_cosmos_to_diffusers.py \
     --transformer_ckpt_path $transformer_ckpt_path \
     --transformer_type Cosmos-2.0-Diffusion-2B-Text2Image \
+    --text_encoder_path google-t5/t5-11b \
+    --tokenizer_path google-t5/t5-11b \
     --vae_type wan2.1 \
-    --output_path outputs/chkpts/ \
+    --output_path converted/cosmos-p2-t2i-2b \
     --save_pipeline
 ```
 
@@ -33,9 +35,7 @@ python scripts/convert_cosmos_to_diffusers.py \
     --transformer_type Cosmos-2.5-Predict-Base-2B \
     --transformer_ckpt_path $transformer_ckpt_path \
     --vae_type wan2.1 \
-    --text_encoder_path TODO \
-    --tokenizer_path TODO \
-    --output_path outputs/chkpts/ \
+    --output_path converted/cosmos-p2.5-base-2b \
     --save_pipeline
 ```
 
@@ -49,6 +49,7 @@ import torch
 from accelerate import init_empty_weights
 from huggingface_hub import snapshot_download
 from transformers import T5EncoderModel, T5TokenizerFast
+from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
 from diffusers import (
     AutoencoderKLCosmos,
@@ -61,6 +62,7 @@ from diffusers import (
     EDMEulerScheduler,
     FlowMatchEulerDiscreteScheduler,
 )
+from diffusers.pipelines.cosmos.pipeline_cosmos25_predict import Cosmos25PredictBase
 
 
 def remove_keys_(key: str, state_dict: Dict[str, Any]):
@@ -278,7 +280,8 @@ TRANSFORMER_CONFIGS = {
     },
     # TODO(migmartin); check these params
     "Cosmos-2.5-Predict-Base-2B": {
-        "in_channels": 16 + 1,  # good
+         # "in_channels": 16 + 1,  # NOTE(migmartin): checkme as +1 is performed in p2.5 codebase
+        "in_channels": 16,  # good
         "out_channels": 16,  # good
         "num_attention_heads": 16,  # good
         "attention_head_dim": 128,  # good
@@ -295,7 +298,7 @@ TRANSFORMER_CONFIGS = {
         "extra_pos_embed_type": None,
         "use_crossattn_projection": True,
         "crossattn_proj_in_channels": 100352,
-        "crossattn_emb_channels": 1024,
+        "encoder_hidden_states_channels": 1024,
     },
 }
 
@@ -432,12 +435,12 @@ def convert_transformer(transformer_type: str, ckpt_path: str, weights_only: boo
     missing_keys = expected_keys - mapped_keys
     unexpected_keys = mapped_keys - expected_keys
     if missing_keys:
-        print("missing keys", flush=True, file=sys.stderr)
+        print(f"ERROR: missing keys ({len(missing_keys)} from state_dict:", flush=True, file=sys.stderr)
         for k in missing_keys:
             print(k)
         sys.exit(1)
     if unexpected_keys:
-        print("unexpected_keys", flush=True, file=sys.stderr)
+        print(f"ERROR: unexpected keys ({len(unexpected_keys)}) from state_dict:", flush=True, file=sys.stderr)
         for k in unexpected_keys:
             print(k)
         sys.exit(2)
@@ -531,13 +534,17 @@ def save_pipeline_cosmos_2_0(args, transformer, vae):
     pipe.save_pretrained(args.output_path, safe_serialization=True, max_shard_size="5GB")
 
 def save_pipeline_cosmos_2_5(args, transformer, vae):
-    # text_encoder = T5EncoderModel.from_pretrained(args.text_encoder_path, torch_dtype=torch.bfloat16)
-    # tokenizer = T5TokenizerFast.from_pretrained(args.tokenizer_path)
+    text_encoder_path = args.text_encoder_path or "nvidia/Cosmos-Reason1-7B"
+    tokenizer_path = args.tokenizer_path or "Qwen/Qwen2.5-VL-7B-Instruct"
+
+    text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        text_encoder_path, torch_dtype="auto", device_map="cpu"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     scheduler = FlowMatchEulerDiscreteScheduler(use_karras_sigmas=True)
 
-    pipe_cls = Cosmos2TextToImagePipeline if "Text2Image" in args.transformer_type else Cosmos2VideoToWorldPipeline
-    pipe = pipe_cls(
+    pipe = Cosmos25PredictBase(
         text_encoder=text_encoder,
         tokenizer=tokenizer,
         transformer=transformer,
@@ -556,8 +563,8 @@ def get_args():
     parser.add_argument(
         "--vae_type", type=str, default="wan2.1", choices=["wan2.1", *list(VAE_CONFIGS.keys())], help="Type of VAE"
     )
-    parser.add_argument("--text_encoder_path", type=str, default="google-t5/t5-11b")
-    parser.add_argument("--tokenizer_path", type=str, default="google-t5/t5-11b")
+    parser.add_argument("--text_encoder_path", type=str, default=None)
+    parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--save_pipeline", action="store_true")
     parser.add_argument("--output_path", type=str, required=True, help="Path where converted model should be saved")
     parser.add_argument("--dtype", default="bf16", help="Torch dtype to save the transformer in.")
@@ -580,8 +587,6 @@ if __name__ == "__main__":
     if args.save_pipeline:
         assert args.transformer_ckpt_path is not None
         assert args.vae_type is not None
-        assert args.text_encoder_path is not None
-        assert args.tokenizer_path is not None
 
     if args.transformer_ckpt_path is not None:
         weights_only = "Cosmos-1.0" in args.transformer_type
@@ -605,10 +610,14 @@ if __name__ == "__main__":
 
     if args.save_pipeline:
         if "Cosmos-1.0" in args.transformer_type:
+            assert args.text_encoder_path is not None
+            assert args.tokenizer_path is not None
             save_pipeline_cosmos_1_0(args, transformer, vae)
         elif "Cosmos-2.0" in args.transformer_type:
+            assert args.text_encoder_path is not None
+            assert args.tokenizer_path is not None
             save_pipeline_cosmos_2_0(args, transformer, vae)
         elif "Cosmos-2.5" in args.transformer_type:
             save_pipeline_cosmos_2_5(args, transformer, vae)
         else:
-            assert False
+            raise AssertionErorr(f"{args.transformer_type} not supported")

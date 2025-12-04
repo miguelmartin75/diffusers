@@ -49,7 +49,7 @@ class CosmosPatchEmbed(nn.Module):
         hidden_states = hidden_states.reshape(
             batch_size, num_channels, num_frames // p_t, p_t, height // p_h, p_h, width // p_w, p_w
         )
-        hidden_states = hidden_states.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7)
+        hidden_states = hidden_states.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7)  # TODO(migmartin): check if this is correct
         hidden_states = self.proj(hidden_states)
         return hidden_states
 
@@ -441,7 +441,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         extra_pos_embed_type: Optional[str] = "learnable",
         use_crossattn_projection: bool = False,
         crossattn_proj_in_channels: int = 1024,
-        crossattn_emb_channels: int = 1024,
+        encoder_hidden_states_channels: int = 1024,
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
@@ -488,9 +488,10 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             hidden_size, patch_size[0] * patch_size[1] * patch_size[2] * out_channels, bias=False
         )
 
-        if use_crossattn_projection:
+        self.use_crossattn_projection = use_crossattn_projection
+        if self.use_crossattn_projection:
             self.crossattn_proj = nn.Sequential(
-                nn.Linear(crossattn_proj_in_channels, crossattn_emb_channels, bias=True),
+                nn.Linear(crossattn_proj_in_channels, encoder_hidden_states_channels, bias=True),
                 nn.GELU(),
             )
 
@@ -506,7 +507,6 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         condition_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        crossattn_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
@@ -534,6 +534,16 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
+        # TODO: if no conditional input do roughly the following
+        # B, _, T, H, W = x_B_C_T_H_W.shape
+        # x_B_C_T_H_W = torch.cat(
+        #     [x_B_C_T_H_W, torch.zeros((B, 1, T, H, W), dtype=x_B_C_T_H_W.dtype, device=x_B_C_T_H_W.device)], dim=1
+        # )
+        B, _, T, H, W = hidden_states.shape
+        hidden_states = torch.cat(
+            [hidden_states, torch.zeros((B, 1, T, H, W), dtype=hidden_states.dtype, device=hidden_states.device)], dim=1
+        )
+        # TODO: cat zeros if no conditional input to go from [1, 17, 1, 88, 160] to [1, 18, 1, 88, 160]
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
 
@@ -555,6 +565,9 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, THW, C]
         else:
             assert False
+
+        if self.use_crossattn_projection:
+            encoder_hidden_states = self.crossattn_proj(encoder_hidden_states)
 
         # 5. Transformer blocks
         for block in self.transformer_blocks:
