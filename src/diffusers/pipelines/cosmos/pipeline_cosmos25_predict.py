@@ -21,12 +21,12 @@ from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...models import AutoencoderKLWan, CosmosTransformer3DModel
-from ...schedulers import FlowMatchEulerDiscreteScheduler
+from ...schedulers import FlowUniPCMultistepScheduler
 from ...utils import is_cosmos_guardrail_available, is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
-from .pipeline_output import CosmosImagePipelineOutput
+from .pipeline_output import CosmosPipelineOutput
 
 
 if is_cosmos_guardrail_available():
@@ -73,67 +73,6 @@ EXAMPLE_DOC_STRING = """
         ```
 """
 
-
-# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
-    **kwargs,
-):
-    r"""
-    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
-    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
-
-    Args:
-        scheduler (`SchedulerMixin`):
-            The scheduler to get timesteps from.
-        num_inference_steps (`int`):
-            The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
-            must be `None`.
-        device (`str` or `torch.device`, *optional*):
-            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
-            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
-
-    Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
-        second element is the number of inference steps.
-    """
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" timestep schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
-
-
 class Cosmos25PredictBase(DiffusionPipeline):
     r"""
     Pipeline for [Cosmos Predict2.5](https://github.com/nvidia-cosmos/cosmos-predict2) base model.
@@ -149,7 +88,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
             Tokenizer associated with the Qwen2.5 VL encoder.
         transformer ([`CosmosTransformer3DModel`]):
             Conditional Transformer to denoise the encoded image latents.
-        scheduler ([`FlowMatchEulerDiscreteScheduler`]):
+        scheduler ([`FlowUniPCMultistepScheduler`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
         vae ([`AutoencoderKLWan`]):
             Variational Auto-Encoder (VAE) Model to encode and decode videos to and from latent representations.
@@ -166,7 +105,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         tokenizer: AutoTokenizer,
         transformer: CosmosTransformer3DModel,
         vae: AutoencoderKLWan,
-        scheduler: FlowMatchEulerDiscreteScheduler,
+        scheduler: FlowUniPCMultistepScheduler,
         safety_checker: CosmosSafetyChecker = None,
     ):
         super().__init__()
@@ -188,16 +127,32 @@ class Cosmos25PredictBase(DiffusionPipeline):
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-        self.sigma_max = 80.0
-        self.sigma_min = 0.002
+        self.sigma_max = 200
+        self.sigma_min = 0.01
         self.sigma_data = 1.0
         self.final_sigmas_type = "sigma_min"
         if self.scheduler is not None:
+            scheduler_config = getattr(self.scheduler, "config", None)
+            if scheduler_config is not None:
+                self.sigma_max = getattr(scheduler_config, "sigma_max", self.sigma_max)
+                self.sigma_min = getattr(scheduler_config, "sigma_min", self.sigma_min)
+                self.sigma_data = getattr(scheduler_config, "sigma_data", self.sigma_data)
+                self.final_sigmas_type = getattr(
+                    scheduler_config, "final_sigmas_type", self.final_sigmas_type
+                )
+
             self.scheduler.register_to_config(
                 sigma_max=self.sigma_max,
                 sigma_min=self.sigma_min,
                 sigma_data=self.sigma_data,
                 final_sigmas_type=self.final_sigmas_type,
+            )
+
+        scheduler_accepts_sigmas = "sigmas" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
+        if not scheduler_accepts_sigmas:
+            raise ValueError(
+                f"The current scheduler class {self.scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" sigmas schedules. Please check whether you are using the correct scheduler."
             )
 
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline._get_prompt_embeds
@@ -367,7 +322,9 @@ class Cosmos25PredictBase(DiffusionPipeline):
         latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if latents is not None:
-            return latents.to(device=device, dtype=dtype) * self.scheduler.config.sigma_max
+            # TODO(migmartin): why does sigma_max scale cause a problem with correct timestep scheduler?
+            # return latents.to(device=device, dtype=dtype) * self.scheduler.config.sigma_max
+            return latents.to(device=device, dtype=dtype)
 
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
@@ -381,7 +338,9 @@ class Cosmos25PredictBase(DiffusionPipeline):
             )
 
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return latents * self.scheduler.config.sigma_max
+        # TODO(migmartin): why does sigma_max scale cause a problem with correct timestep scheduler?
+        # return latents * self.scheduler.config.sigma_max
+        return latents
 
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline.check_inputs
     def check_inputs(
@@ -442,7 +401,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 704,
         width: int = 1280,
-        num_inference_steps: int = 36,
+        num_inference_steps: int = 35,
         guidance_scale: float = 7.0,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -456,6 +415,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        shift: float = 5.0,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -513,7 +473,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 where the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
         if self.safety_checker is None:
             raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
@@ -571,12 +530,8 @@ class Cosmos25PredictBase(DiffusionPipeline):
         )
 
         # 4. Prepare timesteps
-        sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
-        sigmas = torch.linspace(0, 1, num_inference_steps, dtype=sigmas_dtype)
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, device=device, sigmas=sigmas)  # TODO(migmartin): this is wrong (values)
-        if self.scheduler.config.get("final_sigmas_type", "zero") == "sigma_min":
-            # Replace the last sigma (which is zero) with the minimum sigma value
-            self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
+        self.scheduler.set_timesteps(num_inference_steps, shift=shift, device=device)
+        timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
         transformer_dtype = self.transformer.dtype
@@ -608,14 +563,16 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 current_sigma = self.scheduler.sigmas[i]
 
                 current_t = current_sigma / (current_sigma + 1)
-                c_in = 1 - current_t
-                c_skip = 1 - current_t
-                c_out = -current_t
-                timestep = current_t.expand(latents.shape[0]).to(transformer_dtype)  # [B, 1, T, 1, 1]
+                # c_in = 1 - current_t
+                # c_skip = 1 - current_t
+                # c_out = -current_t
+                # timestep = current_t.expand(latents.shape[0]).to(transformer_dtype)  # [B, 1, T, 1, 1]
 
-                latent_model_input = latents * c_in
+                # latent_model_input = latents * c_in
+                latent_model_input = latents
                 latent_model_input = latent_model_input.to(transformer_dtype)
 
+                timestep = torch.stack([t]).to(transformer_dtype)
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
@@ -623,7 +580,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
                     padding_mask=padding_mask,
                     return_dict=False,
                 )[0]
-                noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
+                # noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
 
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond = self.transformer(
@@ -633,7 +590,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
                         padding_mask=padding_mask,
                         return_dict=False,
                     )[0]
-                    noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
+                    # noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
                 noise_pred = (latents - noise_pred) / current_sigma
@@ -670,32 +627,31 @@ class Cosmos25PredictBase(DiffusionPipeline):
             latents = latents / latents_std / self.scheduler.config.sigma_data + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
-            if self.safety_checker is not None:
-                self.safety_checker.to(device)
-                video = self.video_processor.postprocess_video(video, output_type="np")
-                video = (video * 255).astype(np.uint8)
-                video_batch = []
-                for vid in video:
-                    vid = self.safety_checker.check_video_safety(vid)
-                    video_batch.append(vid)
-                video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
-                video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-                self.safety_checker.to("cpu")
-            else:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-            image = [batch[0] for batch in video]
+            assert self.safety_checker is not None
+            self.safety_checker.to(device)
+            video = self.video_processor.postprocess_video(video, output_type="np")
+            video = (video * 255).astype(np.uint8)
+            video_batch = []
+            for vid in video:
+                vid = self.safety_checker.check_video_safety(vid)
+                video_batch.append(vid)
+            video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
+            video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            self.safety_checker.to("cpu")
+
+            frames = video
             if isinstance(video, torch.Tensor):
-                image = torch.stack(image)
+                frames = torch.stack(frames)
             elif isinstance(video, np.ndarray):
-                image = np.stack(image)
+                frames = np.stack(frames)
         else:
-            image = latents[:, :, 0]
+            frames = latents
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            return (frames,)
 
-        return CosmosImagePipelineOutput(images=image)
+        return CosmosPipelineOutput(frames=frames)

@@ -60,6 +60,7 @@ from diffusers import (
     CosmosTransformer3DModel,
     CosmosVideoToWorldPipeline,
     EDMEulerScheduler,
+    FlowUniPCMultistepScheduler,
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.pipelines.cosmos.pipeline_cosmos25_predict import Cosmos25PredictBase
@@ -280,8 +281,8 @@ TRANSFORMER_CONFIGS = {
     },
     # TODO(migmartin); check these params
     "Cosmos-2.5-Predict-Base-2B": {
-         # "in_channels": 16 + 1,  # NOTE(migmartin): checkme as +1 is performed in p2.5 codebase
-        "in_channels": 16,  # good
+         "in_channels": 16 + 1,  # NOTE(migmartin): checkme as +1 is performed in p2.5 codebase
+         # "in_channels": 16,  # good
         "out_channels": 16,  # good
         "num_attention_heads": 16,  # good
         "attention_head_dim": 128,  # good
@@ -537,12 +538,16 @@ def save_pipeline_cosmos_2_5(args, transformer, vae):
     text_encoder_path = args.text_encoder_path or "nvidia/Cosmos-Reason1-7B"
     tokenizer_path = args.tokenizer_path or "Qwen/Qwen2.5-VL-7B-Instruct"
 
+    scheduler = FlowUniPCMultistepScheduler(
+        use_karras_sigmas=True,
+        final_sigmas_type="zero",
+    )
+    # print("scheduler before pipe construction:", scheduler)
+
     text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         text_encoder_path, torch_dtype="auto", device_map="cpu"
     )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
-    scheduler = FlowMatchEulerDiscreteScheduler(use_karras_sigmas=True)
 
     pipe = Cosmos25PredictBase(
         text_encoder=text_encoder,
@@ -552,6 +557,8 @@ def save_pipeline_cosmos_2_5(args, transformer, vae):
         scheduler=scheduler,
         safety_checker=lambda *args, **kwargs: None,
     )
+    print("in pipe", pipe.scheduler)
+    # print("scheduler after pipe construction:", scheduler)
     pipe.save_pretrained(args.output_path, safe_serialization=True, max_shard_size="5GB")
 
 def get_args():
