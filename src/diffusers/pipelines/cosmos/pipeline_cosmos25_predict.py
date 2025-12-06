@@ -382,69 +382,22 @@ class Cosmos25PredictBase(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
-        num_cond_frames = video.size(2)
-        if num_cond_frames >= num_frames:
-            # Take the last `num_frames` frames for conditioning
-            num_cond_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-            video = video[:, :, -num_frames:]
-        else:
-            num_cond_latent_frames = (num_cond_frames - 1) // self.vae_scale_factor_temporal + 1
-            num_padding_frames = num_frames - num_cond_frames
-            last_frame = video[:, :, -1:]
-            padding = last_frame.repeat(1, 1, num_padding_frames, 1, 1)
-            video = torch.cat([video, padding], dim=2)
-
-        if isinstance(generator, list):
-            init_latents = [
-                retrieve_latents(self.vae.encode(video[i].unsqueeze(0)), generator=generator[i])
-                for i in range(batch_size)
-            ]
-        else:
-            init_latents = [retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator) for vid in video]
-
-        init_latents = torch.cat(init_latents, dim=0).to(dtype)
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-        )
-        init_latents = (init_latents - latents_mean) / latents_std * self.scheduler.config.sigma_data
+        if latents is not None:
+            return latents.to(device=device, dtype=dtype) * self.scheduler.config.sigma_max
 
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
-            latents = latents.to(device=device, dtype=dtype)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
 
-        latents = latents * self.scheduler.config.sigma_max
-
-        padding_shape = (batch_size, 1, num_latent_frames, latent_height, latent_width)
-        ones_padding = latents.new_ones(padding_shape)
-        zeros_padding = latents.new_zeros(padding_shape)
-
-        cond_indicator = latents.new_zeros(1, 1, latents.size(2), 1, 1)
-        cond_indicator[:, :, :num_cond_latent_frames] = 1.0
-        cond_mask = cond_indicator * ones_padding + (1 - cond_indicator) * zeros_padding
-
-        uncond_indicator = uncond_mask = None
-        if do_classifier_free_guidance:
-            uncond_indicator = latents.new_zeros(1, 1, latents.size(2), 1, 1)
-            uncond_indicator[:, :, :num_cond_latent_frames] = 1.0
-            uncond_mask = uncond_indicator * ones_padding + (1 - uncond_indicator) * zeros_padding
-
-        return latents, init_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return latents * self.scheduler.config.sigma_max
 
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline.check_inputs
     def check_inputs(
@@ -523,7 +476,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        sigma_conditioning: float = 0.0001,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -583,9 +535,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
             max_sequence_length (`int`, defaults to `512`):
                 The maximum number of tokens in the prompt. If the prompt exceeds this length, it will be truncated. If
                 the prompt is shorter than this length, it will be padded.
-            sigma_conditioning (`float`, defaults to `0.0001`):
-                The sigma value used for scaling conditioning latents. Ideally, it should not be changed or should be
-                set to a small value close to zero.
 
         Examples:
 
@@ -674,7 +623,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         video = video.to(device=device, dtype=vae_dtype)
 
         num_channels_latents = self.transformer.config.in_channels - 1
-        latents, conditioning_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask = self.prepare_latents(
+        latents = self.prepare_latents(
             video,
             batch_size * num_videos_per_prompt,
             # TODO(migmartin): check me
@@ -688,20 +637,18 @@ class Cosmos25PredictBase(DiffusionPipeline):
             generator,
             latents,
         )
-        unconditioning_latents = None
-
-        cond_mask = cond_mask.to(transformer_dtype)
-        if self.do_classifier_free_guidance:
-            uncond_mask = uncond_mask.to(transformer_dtype)
-            unconditioning_latents = conditioning_latents
 
         padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
-        sigma_conditioning = torch.tensor(sigma_conditioning, dtype=torch.float32, device=device)
-        t_conditioning = sigma_conditioning / (sigma_conditioning + 1)
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+
+        # TODO: handle conditional input
+        B, _, T, H, W = latent_model_input.shape
+        latent_model_input = torch.cat(
+            [latent_model_input, torch.zeros((B, 1, T, H, W), dtype=latent_model_input.dtype, device=latent_model_input.device)], dim=1
+        )
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -715,48 +662,29 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 c_in = 1 - current_t
                 c_skip = 1 - current_t
                 c_out = -current_t
-                timestep = current_t.view(1, 1, 1, 1, 1).expand(
-                    latents.size(0), -1, latents.size(2), -1, -1
-                )  # [B, 1, T, 1, 1]
+                timestep = current_t.expand(latents.shape[0]).to(transformer_dtype)  # [B, 1, T, 1, 1]
 
-                cond_latent = latents * c_in
-                cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * cond_latent
-                cond_latent = cond_latent.to(transformer_dtype)
-                cond_timestep = cond_indicator * t_conditioning + (1 - cond_indicator) * timestep
-                cond_timestep = cond_timestep.to(transformer_dtype)
+                latent_model_input = latents * c_in
+                latent_model_input = latent_model_input.to(transformer_dtype)
 
                 noise_pred = self.transformer(
-                    hidden_states=cond_latent,
-                    timestep=cond_timestep,
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
-                    fps=fps,
-                    condition_mask=cond_mask,
                     padding_mask=padding_mask,
                     return_dict=False,
                 )[0]
                 noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
-                noise_pred = cond_indicator * conditioning_latents + (1 - cond_indicator) * noise_pred
 
                 if self.do_classifier_free_guidance:
-                    uncond_latent = latents * c_in
-                    uncond_latent = uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * uncond_latent
-                    uncond_latent = uncond_latent.to(transformer_dtype)
-                    uncond_timestep = uncond_indicator * t_conditioning + (1 - uncond_indicator) * timestep
-                    uncond_timestep = uncond_timestep.to(transformer_dtype)
-
                     noise_pred_uncond = self.transformer(
-                        hidden_states=uncond_latent,
-                        timestep=uncond_timestep,
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
-                        fps=fps,
-                        condition_mask=uncond_mask,
                         padding_mask=padding_mask,
                         return_dict=False,
                     )[0]
                     noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
-                    noise_pred_uncond = (
-                        uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * noise_pred_uncond
-                    )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
                 noise_pred = (latents - noise_pred) / current_sigma
@@ -795,20 +723,18 @@ class Cosmos25PredictBase(DiffusionPipeline):
             latents = latents * latents_std / self.scheduler.config.sigma_data + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
-            if self.safety_checker is not None:
-                self.safety_checker.to(device)
-                video = self.video_processor.postprocess_video(video, output_type="np")
-                video = (video * 255).astype(np.uint8)
-                video_batch = []
-                for vid in video:
-                    vid = self.safety_checker.check_video_safety(vid)
-                    video_batch.append(vid)
-                video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
-                video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-                self.safety_checker.to("cpu")
-            else:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
+            assert self.safety_checker is not None
+            self.safety_checker.to(device)
+            video = self.video_processor.postprocess_video(video, output_type="np")
+            video = (video * 255).astype(np.uint8)
+            video_batch = []
+            for vid in video:
+                vid = self.safety_checker.check_video_safety(vid)
+                video_batch.append(vid)
+            video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
+            video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            self.safety_checker.to("cpu")
         else:
             video = latents
 
