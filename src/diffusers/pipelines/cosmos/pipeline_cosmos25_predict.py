@@ -139,43 +139,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-<<<<<<< HEAD
-        self.sigma_max = 200
-        self.sigma_min = 0.01
-=======
-        # TODO(migmartin): this is wrong sigmas
-        self.sigma_max = 80.0
-        self.sigma_min = 0.002
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
-        self.sigma_data = 1.0
-        self.final_sigmas_type = "sigma_min"
-        if self.scheduler is not None:
-            scheduler_config = getattr(self.scheduler, "config", None)
-            if scheduler_config is not None:
-                self.sigma_max = getattr(scheduler_config, "sigma_max", self.sigma_max)
-                self.sigma_min = getattr(scheduler_config, "sigma_min", self.sigma_min)
-                self.sigma_data = getattr(scheduler_config, "sigma_data", self.sigma_data)
-                self.final_sigmas_type = getattr(
-                    scheduler_config, "final_sigmas_type", self.final_sigmas_type
-                )
-
-            self.scheduler.register_to_config(
-                sigma_max=self.sigma_max,
-                sigma_min=self.sigma_min,
-                sigma_data=self.sigma_data,
-                final_sigmas_type=self.final_sigmas_type,
-            )
-
-<<<<<<< HEAD
-        scheduler_accepts_sigmas = "sigmas" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
-        if not scheduler_accepts_sigmas:
-            raise ValueError(
-                f"The current scheduler class {self.scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-=======
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
-
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline._get_prompt_embeds
     def _get_prompt_embeds(
         self,
@@ -352,7 +315,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
-        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        shape = (batch_size, num_channels_latents - 1, num_latent_frames, latent_height, latent_width)
 
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -426,10 +389,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 704,
         width: int = 1280,
-<<<<<<< HEAD
-=======
         num_frames: int = 93,
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
         num_inference_steps: int = 35,
         guidance_scale: float = 7.0,
         fps: int = 16,
@@ -514,11 +474,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-<<<<<<< HEAD
-=======
-
-
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
         if self.safety_checker is None:
             raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
@@ -574,18 +529,8 @@ class Cosmos25PredictBase(DiffusionPipeline):
         )
 
         # 4. Prepare timesteps
-<<<<<<< HEAD
         self.scheduler.set_timesteps(num_inference_steps, shift=shift, device=device)
         timesteps = self.scheduler.timesteps
-=======
-        # TODO(migmartin): timesteps is different in p2.5 as flow matching used instead
-        sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
-        sigmas = torch.linspace(0, 1, num_inference_steps, dtype=sigmas_dtype)
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, device=device, sigmas=sigmas)
-        if self.scheduler.config.final_sigmas_type == "sigma_min":
-            # Replace the last sigma (which is zero) with the minimum sigma value
-            self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
 
         # 5. Prepare latent variables
         vae_dtype = self.vae.dtype
@@ -600,7 +545,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
             video = self.video_processor.preprocess_video(video, height, width)
         video = video.to(device=device, dtype=vae_dtype)
 
-        num_channels_latents = self.transformer.config.in_channels - 1
+        num_channels_latents = self.transformer.config.in_channels
         latents = self.prepare_latents(
             video,
             batch_size * num_videos_per_prompt,
@@ -616,17 +561,12 @@ class Cosmos25PredictBase(DiffusionPipeline):
             latents,
         )
 
+        # TODO(migmartin): needed?
         padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
-
-        # TODO: handle conditional input
-        B, _, T, H, W = latent_model_input.shape
-        latent_model_input = torch.cat(
-            [latent_model_input, torch.zeros((B, 1, T, H, W), dtype=latent_model_input.dtype, device=latent_model_input.device)], dim=1
-        )
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -634,9 +574,9 @@ class Cosmos25PredictBase(DiffusionPipeline):
                     continue
 
                 self._current_timestep = t
-                current_sigma = self.scheduler.sigmas[i]
+                # current_sigma = self.scheduler.sigmas[i]
 
-                current_t = current_sigma / (current_sigma + 1)
+                # current_t = current_sigma / (current_sigma + 1)
                 # c_in = 1 - current_t
                 # c_skip = 1 - current_t
                 # c_out = -current_t
@@ -647,8 +587,14 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 latent_model_input = latent_model_input.to(transformer_dtype)
 
                 timestep = torch.stack([t]).to(transformer_dtype)
+                timestep *= 0.001  # NOTE: timestep scale
+                print(f"{i} timestep = {timestep} (original={t})")
+                B, _, T, H, W = latent_model_input.shape
+                # TODO: condition mask should be non-zero for conditional input
+                condition_mask = torch.zeros((B, 1, T, H, W), dtype=latent_model_input.dtype, device=latent_model_input.device)
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
+                    condition_mask=condition_mask,
                     timestep=timestep,
                     encoder_hidden_states=prompt_embeds,
                     padding_mask=padding_mask,
@@ -659,6 +605,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond = self.transformer(
                         hidden_states=latent_model_input,
+                        condition_mask=condition_mask,
                         timestep=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
                         padding_mask=padding_mask,
@@ -667,7 +614,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
                     # noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
-                noise_pred = (latents - noise_pred) / current_sigma
+                # noise_pred = (latents - noise_pred) / current_sigma
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
@@ -700,7 +647,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents = latents * latents_std / self.scheduler.config.sigma_data + latents_mean
+            latents = latents * latents_std + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
             assert self.safety_checker is not None
@@ -715,30 +662,13 @@ class Cosmos25PredictBase(DiffusionPipeline):
             video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
             video = self.video_processor.postprocess_video(video, output_type=output_type)
             self.safety_checker.to("cpu")
-<<<<<<< HEAD
-
-            frames = video
-            if isinstance(video, torch.Tensor):
-                frames = torch.stack(frames)
-            elif isinstance(video, np.ndarray):
-                frames = np.stack(frames)
-        else:
-            frames = latents
-=======
         else:
             video = latents
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-<<<<<<< HEAD
-            return (frames,)
-
-        return CosmosPipelineOutput(frames=frames)
-=======
             return (video,)
 
         return CosmosPipelineOutput(frames=video)
->>>>>>> cosmos/predict2.5-base-unipc-scheduler
