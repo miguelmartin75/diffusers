@@ -280,8 +280,8 @@ TRANSFORMER_CONFIGS = {
     },
     # TODO(migmartin); check these params
     "Cosmos-2.5-Predict-Base-2B": {
-         # "in_channels": 16 + 1,  # NOTE(migmartin): checkme as +1 is performed in p2.5 codebase
-        "in_channels": 16,  # good
+        "in_channels": 16 + 1,  # NOTE(migmartin): checkme as +1 is performed in p2.5 codebase
+         # "in_channels": 16,  # good
         "out_channels": 16,  # good
         "num_attention_heads": 16,  # good
         "attention_head_dim": 128,  # good

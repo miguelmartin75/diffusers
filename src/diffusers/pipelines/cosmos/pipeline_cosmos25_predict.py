@@ -26,7 +26,7 @@ from ...utils import is_cosmos_guardrail_available, is_torch_xla_available, logg
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
-from .pipeline_output import CosmosImagePipelineOutput
+from .pipeline_output import CosmosPipelineOutput
 
 
 if is_cosmos_guardrail_available():
@@ -670,32 +670,26 @@ class Cosmos25PredictBase(DiffusionPipeline):
             latents = latents / latents_std / self.scheduler.config.sigma_data + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
-            if self.safety_checker is not None:
-                self.safety_checker.to(device)
-                video = self.video_processor.postprocess_video(video, output_type="np")
-                video = (video * 255).astype(np.uint8)
-                video_batch = []
-                for vid in video:
-                    vid = self.safety_checker.check_video_safety(vid)
-                    video_batch.append(vid)
-                video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
-                video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-                self.safety_checker.to("cpu")
-            else:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-            image = [batch[0] for batch in video]
-            if isinstance(video, torch.Tensor):
-                image = torch.stack(image)
-            elif isinstance(video, np.ndarray):
-                image = np.stack(image)
-        else:
-            image = latents[:, :, 0]
+            assert self.safety_checker is not None
+            self.safety_checker.to(device)
+            video = self.video_processor.postprocess_video(video, output_type="np")
+            video = (video * 255).astype(np.uint8)
+            video_batch = []
+            for vid in video:
+                vid = self.safety_checker.check_video_safety(vid)
+                video_batch.append(vid)
+            video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
+            video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
+            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            self.safety_checker.to("cpu")
+            # else:
+            #     video = self.video_processor.postprocess_video(video, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
+        frames = video
         if not return_dict:
-            return (image,)
+            return (frames,)
 
-        return CosmosImagePipelineOutput(images=image)
+        return CosmosPipelineOutput(frames=frames)
