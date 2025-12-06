@@ -534,13 +534,6 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
-
-        B, _, T, H, W = hidden_states.shape
-        # TODO: if conditional input don't use zeros
-        hidden_states = torch.cat(
-            [hidden_states, torch.zeros((B, 1, T, H, W), dtype=hidden_states.dtype, device=hidden_states.device)], dim=1
-        )
-        # TODO: cat zeros if no conditional input to go from [1, 17, 1, 88, 160] to [1, 18, 1, 88, 160]
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
 
