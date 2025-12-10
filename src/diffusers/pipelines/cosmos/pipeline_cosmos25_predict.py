@@ -661,10 +661,15 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 timestep = torch.stack([t]).to(transformer_dtype)
                 timestep *= 0.001  # NOTE: timestep scale, TODO: make scheduler scale this instead
                 print(f"{i} timestep = {timestep} (original={t})")
+                latent_model_input = latents
+                latent_model_input = latent_model_input.to(transformer_dtype)
 
-                cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * latents
+                B, _, T, H, W = latent_model_input.shape
+                cond_mask = torch.zeros((B, 1, T, H, W), dtype=latent_model_input.dtype, device=latent_model_input.device)
+
+                # cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * latents
+                cond_latent = latents
                 cond_latent = cond_latent.to(transformer_dtype)
-                # TODO(migmartin): checkme
                 # cond_timestep = cond_indicator * t_conditioning + (1 - cond_indicator) * timestep # == timestep for text2video
                 # cond_timestep = cond_timestep.to(transformer_dtype)
                 noise_pred = self.transformer(
@@ -677,11 +682,13 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 )[0]
 
                 if self.do_classifier_free_guidance:
-                    uncond_latent = uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * latents # == latents for text2video
-                    uncond_latent = uncond_latent.to(transformer_dtype)
-                    # TODO(migmartin): checkme
+                    # uncond_latent = uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * latents # == latents for text2video
+                    # uncond_latent = uncond_latent.to(transformer_dtype)
                     # uncond_timestep = uncond_indicator * t_conditioning + (1 - uncond_indicator) * timestep # == timestep for text2video
                     # uncond_timestep = uncond_timestep.to(transformer_dtype)
+                    uncond_latent = latents
+                    uncond_latent = uncond_latent.to(transformer_dtype)
+                    uncond_mask = cond_mask
                     noise_pred_uncond = self.transformer(
                         hidden_states=uncond_latent,
                         condition_mask=uncond_mask,
