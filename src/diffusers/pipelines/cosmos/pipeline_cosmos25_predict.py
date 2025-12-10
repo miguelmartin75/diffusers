@@ -303,7 +303,8 @@ class Cosmos25PredictBase(DiffusionPipeline):
         num_channels_latents: int = 16,
         height: int = 704,
         width: int = 1280,
-        num_frames: int = 93,
+        num_frames_in: int = 93,
+        num_frames_out: int = 93,
         do_classifier_free_guidance: bool = True,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
@@ -316,36 +317,32 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        if video is None:
-            B = batch_size
-            C = num_channels_latents
-            T = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-            H = height // self.vae_scale_factor_spatial
-            W = width // self.vae_scale_factor_spatial
-            shape = (B, C, T, H, W)
+        B = batch_size
+        C = num_channels_latents
+        T = (num_frames_out - 1) // self.vae_scale_factor_temporal + 1
+        H = height // self.vae_scale_factor_spatial
+        W = width // self.vae_scale_factor_spatial
+        shape = (B, C, T, H, W)
+        assert video.shape[2] == num_frames_out
+
+        if num_frames_in == 0:
 
             if latents is None:
                 latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
+            # TODO: T, W, H == 1 for this
             cond_mask = torch.zeros((B, 1, T, H, W), dtype=latents.dtype, device=latents.device)
             uncond_mask = torch.zeros((B, 1, T, H, W), dtype=latents.dtype, device=latents.device)
 
-            cond_indicator = latents.new_zeros(B, 1, T, 1, 1, dtype=latents.dtype, device=latents.device)
-            uncond_indicator = latents.new_zeros(B, 1, T, 1, 1, dtype=latents.dtype, device=latents.device)
             init_latents = torch.zeros_like(latents)
 
             return (
                 latents,
                 init_latents,
-                cond_indicator,
-                uncond_indicator,
                 cond_mask,
                 uncond_mask,
             )
         else:
-            num_cond_frames = video.size(2)
-            assert num_cond_frames <= num_frames, "num_cond_frames must be less than or equal to num_frames"
-
             if isinstance(generator, list):
                 init_latents = [
                     retrieve_latents(self.vae.encode(video[i].unsqueeze(0)), generator=generator[i])
@@ -364,21 +361,16 @@ class Cosmos25PredictBase(DiffusionPipeline):
             )
             init_latents = (init_latents - latents_mean) / latents_std
 
-            num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
-            latent_height = height // self.vae_scale_factor_spatial
-            latent_width = width // self.vae_scale_factor_spatial
-            shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
-
             if latents is None:
                 latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             else:
                 latents = latents.to(device=device, dtype=dtype)
 
-            padding_shape = (batch_size, 1, num_latent_frames, latent_height, latent_width)
+            padding_shape = (B, 1, T, H, W)
             ones_padding = latents.new_ones(padding_shape)
             zeros_padding = latents.new_zeros(padding_shape)
 
-            num_cond_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+            num_cond_latent_frames = (num_frames_in - 1) // self.vae_scale_factor_temporal + 1
             cond_indicator = latents.new_zeros(1, 1, latents.size(2), 1, 1)
             cond_indicator[:, :, :num_cond_latent_frames] = 1.0
             cond_mask = cond_indicator * ones_padding + (1 - cond_indicator) * zeros_padding
@@ -392,8 +384,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
             return (
                 latents,
                 init_latents,
-                cond_indicator,
-                uncond_indicator,
                 cond_mask,
                 uncond_mask,
             )
@@ -606,6 +596,7 @@ class Cosmos25PredictBase(DiffusionPipeline):
         vae_dtype = self.vae.dtype
         transformer_dtype = self.transformer.dtype
 
+        num_frames_in = None
         if image is not None:
             # NOTE: pad with zeros
             # TODO: handle batch_size > 1
@@ -615,27 +606,30 @@ class Cosmos25PredictBase(DiffusionPipeline):
             video = video.unsqueeze(0)  # TODO: handle batch_size > 1
         elif video is None:
             video = torch.zeros(batch_size, num_frames, 3, height, width, dtype=torch.uint8)
-
+            num_frames_in = 0
 
         assert video is not None
         video = self.video_processor.preprocess_video(video, height, width)
+        if num_frames_in is None:
+            num_frames_in = video.shape[0] # TODO: checkme
         # TODO: check read_and_process_video in packages/cosmos-oss/projects/cosmos/predict2/inference/video2world.py
         # TODO: pad with last frame for conditional video input
         video = video.to(device=device, dtype=vae_dtype)
 
         num_channels_latents = self.transformer.config.in_channels - 1
-        latents, conditioning_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask = self.prepare_latents(
-            video,
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            self.do_classifier_free_guidance,
-            torch.float32,
-            device,
-            generator,
-            latents,
+        latents, conditioning_latents, cond_mask, uncond_mask = self.prepare_latents(
+            video=video,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames_in=num_frames_in,
+            num_frames_out=num_frames,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=latents,
         )
         cond_mask = cond_mask.to(transformer_dtype)
 
@@ -664,12 +658,10 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 latent_model_input = latents
                 latent_model_input = latent_model_input.to(transformer_dtype)
 
-                B, _, T, H, W = latent_model_input.shape
-                cond_mask = torch.zeros((B, 1, T, H, W), dtype=latent_model_input.dtype, device=latent_model_input.device)
-
                 # cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * latents
                 cond_latent = latents
                 cond_latent = cond_latent.to(transformer_dtype)
+
                 # cond_timestep = cond_indicator * t_conditioning + (1 - cond_indicator) * timestep # == timestep for text2video
                 # cond_timestep = cond_timestep.to(transformer_dtype)
                 noise_pred = self.transformer(
