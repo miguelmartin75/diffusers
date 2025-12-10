@@ -141,6 +141,18 @@ class Cosmos25PredictBase(DiffusionPipeline):
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).float()
+            if getattr(self.vae.config, "latents_mean", None) is not None
+            else None
+        )
+        latents_std = (
+            torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).float()
+            if getattr(self.vae.config, "latents_std", None) is not None
+            else None
+        )
+        self.latents_mean = latents_mean
+        self.latents_std = latents_std
 
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline._get_prompt_embeds
     def _get_prompt_embeds(
@@ -342,6 +354,12 @@ class Cosmos25PredictBase(DiffusionPipeline):
             )
         else:
             # TODO: checkme with load video -> encode -> retrieve_latents -> decode
+            if video is None:
+                raise ValueError("`video` must be provided when `num_frames_in` is greater than 0.")
+            needs_preprocessing = not (isinstance(video, torch.Tensor) and video.ndim == 5 and video.shape[1] == 3)
+            if needs_preprocessing:
+                video = self.video_processor.preprocess_video(video, height, width)
+            video = video.to(device=device, dtype=self.vae.dtype)
             if isinstance(generator, list):
                 cond_latents = [
                     retrieve_latents(self.vae.encode(video[i].unsqueeze(0)), generator=generator[i])
@@ -352,12 +370,10 @@ class Cosmos25PredictBase(DiffusionPipeline):
 
             cond_latents = torch.cat(cond_latents, dim=0).to(dtype)
 
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
-            )
+            if self.latents_mean is None or self.latents_std is None:
+                raise ValueError("VAE configuration must define `latents_mean` and `latents_std`.")
+            latents_mean = self.latents_mean.to(device=device, dtype=dtype)
+            latents_std = self.latents_std.to(device=device, dtype=dtype)
             cond_latents = (cond_latents - latents_mean) / latents_std
 
             if latents is None:
@@ -701,17 +717,10 @@ class Cosmos25PredictBase(DiffusionPipeline):
         self._current_timestep = None
 
         if not output_type == "latent":
-            # TODO: store this in the class
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
+            if self.latents_mean is None or self.latents_std is None:
+                raise ValueError("VAE configuration must define `latents_mean` and `latents_std`.")
+            latents_mean = self.latents_mean.to(latents.device, latents.dtype)
+            latents_std = self.latents_std.to(latents.device, latents.dtype)
             latents = latents * latents_std + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
