@@ -608,22 +608,29 @@ class Cosmos25PredictBase(DiffusionPipeline):
 
         num_frames_in = None
         if image is not None:
-            # NOTE: pad with zeros
             # TODO: handle batch_size > 1
             assert batch_size == 1, "batch_size must be 1 for image input"
             image = torchvision.transforms.functional.to_tensor(image).unsqueeze(0)
             video = torch.cat([image, torch.zeros_like(image).repeat(num_frames - 1, 1, 1, 1)], dim=0)
-            video = video.unsqueeze(0)  # TODO: handle batch_size > 1
+            video = video.unsqueeze(0)
+            num_frames_in = 1
         elif video is None:
             video = torch.zeros(batch_size, num_frames, 3, height, width, dtype=torch.uint8)
             num_frames_in = 0
+        else:
+            num_frames_in = len(video)
 
         assert video is not None
         video = self.video_processor.preprocess_video(video, height, width)
-        if num_frames_in is None:
-            num_frames_in = video.shape[0] # TODO: checkme
-        # TODO: check read_and_process_video in packages/cosmos-oss/projects/cosmos/predict2/inference/video2world.py
-        # TODO: pad with last frame for conditional video input
+
+        # pad with last frame (for video2world)
+        if video.shape[2] < num_frames:
+            assert batch_size == 1, "batch_size must be 1 for padding frames"
+            n_pad_frames = num_frames - num_frames_in
+            last_frame = video[0, :, -1:, :, :]  # [C, T==1, H, W]
+            pad_frames = last_frame.repeat(1, 1, n_pad_frames, 1, 1)  # [B, C, T, H, W]
+            video = torch.cat((video, pad_frames), dim=2)
+
         video = video.to(device=device, dtype=vae_dtype)
 
         num_channels_latents = self.transformer.config.in_channels - 1
@@ -662,7 +669,6 @@ class Cosmos25PredictBase(DiffusionPipeline):
                 # TODO: make scheduler scale this instead
                 timestep *= 0.001  # NOTE: timestep scale
                 timestep = timestep.to(transformer_dtype)
-                print(f"{i} timestep = {timestep} (original={t})")
 
                 in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents  # TODO: could use cond_indicator
                 in_latents = in_latents.to(transformer_dtype)
