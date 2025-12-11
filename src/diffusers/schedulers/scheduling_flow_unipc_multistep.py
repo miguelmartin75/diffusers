@@ -168,7 +168,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError(" you have to pass a value for `mu` when `use_dynamic_shifting` is set to be `True`")
 
-        if self.use_karras_sigmas:
+        if self.config.use_karras_sigmas:
             # force to use the exact sigma used in edm sampler
             sigma_max = 200
             sigma_min = 0.01
