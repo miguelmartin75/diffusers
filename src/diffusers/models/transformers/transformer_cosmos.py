@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union, Dict, Any
 
 import numpy as np
 import torch
@@ -154,8 +154,8 @@ class CosmosAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("CosmosAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
-
-    def __call__(
+    
+    def compute_attn(
         self,
         attn: Attention,
         hidden_states: torch.Tensor,
@@ -191,7 +191,6 @@ class CosmosAttnProcessor2_0:
             query_idx = torch.tensor(query.size(3), device=query.device)
             key_idx = torch.tensor(key.size(3), device=key.device)
             value_idx = torch.tensor(value.size(3), device=value.device)
-
         else:
             query_idx = query.size(3)
             key_idx = key.size(3)
@@ -204,12 +203,131 @@ class CosmosAttnProcessor2_0:
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).type_as(query)
+        return hidden_states
 
-        # 6. Output projection
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden_states = self.compute_attn(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+        )
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
         return hidden_states
+
+class CosmosAttnProcessor2_5(CosmosAttnProcessor2_0):
+    def __init__(self):
+        if not hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            raise ImportError(
+                "CosmosAttnProcessor2_5 requires PyTorch 2.0. "
+                "Please upgrade PyTorch to 2.0 or newer."
+            )
+
+    def compute_attn_i2v(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        img_context=None,
+        attention_mask=None,
+    ):
+        q_img = attn.q_img(hidden_states)
+        k_img = attn.k_img(img_context)
+        v_img = attn.v_img(img_context)
+
+        batch_size = hidden_states.shape[0]
+
+        dim_head = attn.out_dim // attn.heads
+        q_img = q_img.view(batch_size, -1, attn.heads, dim_head).transpose(1, 2)
+        k_img = k_img.view(batch_size, -1, attn.heads, dim_head).transpose(1, 2)
+        v_img = v_img.view(batch_size, -1, attn.heads, dim_head).transpose(1, 2)
+
+        q_img = attn.q_img_norm(q_img)
+        k_img = attn.k_img_norm(k_img)
+
+        q_img_idx = q_img.size(3)
+        k_img_idx = k_img.size(3)
+        v_img_idx = v_img.size(3)
+        k_img = k_img.repeat_interleave(q_img_idx // k_img_idx, dim=3)
+        v_img = v_img.repeat_interleave(q_img_idx // v_img_idx, dim=3)
+        img_out = torch.nn.functional.scaled_dot_product_attention(
+            q_img, k_img, v_img, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        img_out = img_out.transpose(1, 2).flatten(2, 3).type_as(q_img)
+        return img_out
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
+        attention_mask: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
+        image_rotary_emb=None,
+    ) -> torch.Tensor:
+        if not isinstance(encoder_hidden_states, tuple):
+            raise ValueError("Expected encoder_hidden_states as (text_context, img_context) tuple.")
+
+        text_context, img_context = encoder_hidden_states if encoder_hidden_states else (None, None)
+        text_mask, img_mask = attention_mask if attention_mask else (None, None)
+
+        attn_out = self.compute_attn(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=text_context,
+            attention_mask=text_mask,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        if img_context is not None:
+            img_out = self.compute_attn_i2v(
+                attn=attn,
+                hidden_states=hidden_states,
+                img_context=img_context,
+                attention_mask=img_mask,
+            )
+            hidden_states = attn_out + img_out
+        else:
+            hidden_states = attn_out
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+class CosmosAttention(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # add parameters for image q/k/v
+        inner_dim = self.heads * self.to_q.out_features // self.heads
+        self.q_img = nn.Linear(self.query_dim, inner_dim, bias=False)
+        self.k_img = nn.Linear(self.query_dim, inner_dim, bias=False)
+        self.v_img = nn.Linear(self.query_dim, inner_dim, bias=False)
+        self.q_img_norm = RMSNorm(self.to_q.out_features // self.heads, eps=1e-6, elementwise_affine=True)
+        self.k_img_norm = RMSNorm(self.to_k.out_features // self.heads, eps=1e-6, elementwise_affine=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
+        attention_mask: Optional[torch.Tensor] = None,
+        **cross_attention_kwargs,
+    ) -> torch.Tensor:
+        return super().forward(
+            hidden_states=hidden_states,
+            # NOTE: type-hint in base class can be ignored
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            **cross_attention_kwargs,
+        )
 
 
 class CosmosTransformerBlock(nn.Module):
@@ -222,12 +340,16 @@ class CosmosTransformerBlock(nn.Module):
         adaln_lora_dim: int = 256,
         qk_norm: str = "rms_norm",
         out_bias: bool = False,
+        img_context: bool = False,
+        before_proj: bool = False,
+        after_proj: bool = False,
     ) -> None:
         super().__init__()
 
         hidden_size = num_attention_heads * attention_head_dim
 
         self.norm1 = CosmosAdaLayerNormZero(in_features=hidden_size, hidden_features=adaln_lora_dim)
+        self.img_context = img_context
         self.attn1 = Attention(
             query_dim=hidden_size,
             cross_attention_dim=None,
@@ -240,30 +362,57 @@ class CosmosTransformerBlock(nn.Module):
         )
 
         self.norm2 = CosmosAdaLayerNormZero(in_features=hidden_size, hidden_features=adaln_lora_dim)
-        self.attn2 = Attention(
-            query_dim=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            qk_norm=qk_norm,
-            elementwise_affine=True,
-            out_bias=out_bias,
-            processor=CosmosAttnProcessor2_0(),
-        )
+        if img_context:
+            self.attn2 = CosmosAttention(
+                query_dim=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                qk_norm=qk_norm,
+                elementwise_affine=True,
+                out_bias=out_bias,
+                processor=CosmosAttnProcessor2_5(),
+            )
+        else:
+            self.attn2 = Attention(
+                query_dim=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                qk_norm=qk_norm,
+                elementwise_affine=True,
+                out_bias=out_bias,
+                processor=CosmosAttnProcessor2_0(),
+            )
 
         self.norm3 = CosmosAdaLayerNormZero(in_features=hidden_size, hidden_features=adaln_lora_dim)
         self.ff = FeedForward(hidden_size, mult=mlp_ratio, activation_fn="gelu", bias=out_bias)
 
+        # NOTE: zero conv for CosmosControlNet 
+        self.before_proj = None
+        self.after_proj = None
+        if before_proj:
+            # TODO: check hint_dim in i4
+            self.before_proj = nn.Linear(hidden_size, hidden_size)
+        if after_proj:
+            self.after_proj = nn.Linear(hidden_size, hidden_size)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: Union[Optional[torch.Tensor], Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]],
         embedded_timestep: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         extra_pos_emb: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        controlnet_residual: Optional[torch.Tensor] = None,
+        latents: Optional[torch.Tensor] = None,
+        block_idx: Optional[int] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.before_proj is not None:
+            hidden_states = self.before_proj(hidden_states) + latents
+
         if extra_pos_emb is not None:
             hidden_states = hidden_states + extra_pos_emb
 
@@ -283,6 +432,16 @@ class CosmosTransformerBlock(nn.Module):
         norm_hidden_states, gate = self.norm3(hidden_states, embedded_timestep, temb)
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate * ff_output
+
+        if controlnet_residual is not None:
+            assert self.after_proj is None
+            # NOTE: this is assumed to be scaled by the controlnet
+            hidden_states += controlnet_residual
+
+        if self.after_proj is not None:
+            assert controlnet_residual is None
+            hs_proj = self.after_proj(hidden_states)
+            return hidden_states, hs_proj
 
         return hidden_states
 
@@ -416,6 +575,17 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             Whether to concatenate the padding mask to the input latent tensors.
         extra_pos_embed_type (`str`, *optional*, defaults to `learnable`):
             The type of extra positional embeddings to use. Can be one of `None` or `learnable`.
+        controlnet_block_every_n (`int`, *optional*):
+            Interval between transformer blocks that should receive control residuals (for example, `7` to inject after
+            every seventh block). Required for Cosmos Transfer2.5.
+        img_context_dim_in (`int`, *optional*):
+            The dimension of the input image context feature vector, i.e. it is the D in [B, N, D].
+        img_context_num_tokens (`int`):
+            The number of tokens in the image context feature vector, i.e. it is
+            the N in [B, N, D]. If `img_context_dim_in` is not provided, then this parameter is ignored.
+        img_context_dim_out (`int`):
+            The output dimension of the image context projection layer. If
+            `img_context_dim_in` is not provided, then this parameter is ignored.
     """
 
     _supports_gradient_checkpointing = True
@@ -442,6 +612,10 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         use_crossattn_projection: bool = False,
         crossattn_proj_in_channels: int = 1024,
         encoder_hidden_states_channels: int = 1024,
+        controlnet_block_every_n: Optional[int] = None,
+        img_context_dim_in: Optional[int] = None,
+        img_context_num_tokens: int = 256,
+        img_context_dim_out: int = 2048,
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
@@ -477,6 +651,7 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     adaln_lora_dim=adaln_lora_dim,
                     qk_norm="rms_norm",
                     out_bias=False,
+                    img_context=self.config.img_context_dim_in is not None and self.config.img_context_dim_in > 0,
                 )
                 for _ in range(num_layers)
             ]
@@ -496,17 +671,39 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.gradient_checkpointing = False
 
-    def forward(
+        if self.config.img_context_dim_in:
+            self.img_context_proj = nn.Sequential(
+                nn.Linear(self.config.img_context_dim_in, self.config.img_context_dim_out, bias=True),
+                nn.GELU(),
+            )
+
+    def prepare_inputs(
         self,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        fps: Optional[int] = None,
-        condition_mask: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        return_dict: bool = True,
+        encoder_hidden_states: Tuple[torch.Tensor | None, torch.Tensor | None] | torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        fps: int | None = None,
+        condition_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        r"""
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, channels, num_frames, height, width)`):
+                Latent inputs to the transformer.
+            timestep (`torch.Tensor`):
+                Current diffusion timestep.
+            encoder_hidden_states (`torch.Tensor`):
+                Conditional text and image/video embeddings.
+            attention_mask (`torch.Tensor`, *optional*):
+                Attention mask applied to cross-attention.
+            fps (`int`, *optional*):
+                Frames per second for rotary embeddings on video inputs.
+            condition_mask (`torch.Tensor`, *optional*):
+                Additional per-pixel conditioning flags.
+            padding_mask (`torch.Tensor`, *optional*):
+                Mask highlighting padded spatial regions.
+        """
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 
         # 1. Concatenate padding mask if needed & prepare attention mask
@@ -554,34 +751,109 @@ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 for x in (temb, embedded_timestep)
             )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, THW, C]
         else:
-            assert False
+            raise ValueError(f"Expected timestep to have shape [B, 1, T, 1, 1] or [T], but got {timestep.shape}")
 
+        text_context, img_context = encoder_hidden_states if isinstance(encoder_hidden_states, tuple) else (encoder_hidden_states, None)
         if self.config.use_crossattn_projection:
-            encoder_hidden_states = self.crossattn_proj(encoder_hidden_states)
+            text_context = self.crossattn_proj(text_context)
+
+        if img_context is not None and self.config.img_context_dim_in:
+            img_context = self.img_context_proj(img_context)
+
+        prepared_inputs = {
+            "hidden_states": hidden_states,
+            "temb": temb,
+            "embedded_timestep": embedded_timestep,
+            "image_rotary_emb": image_rotary_emb,
+            "extra_pos_emb": extra_pos_emb,
+            "attention_mask": attention_mask,
+            "encoder_hidden_states": (text_context, img_context) if isinstance(encoder_hidden_states, tuple) else text_context,
+            "num_frames": num_frames,
+            "post_patch_num_frames": post_patch_num_frames,
+            "post_patch_height": post_patch_height,
+            "post_patch_width": post_patch_width,
+        }
+        return prepared_inputs
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        block_controlnet_hidden_states: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        fps: Optional[int] = None,
+        condition_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        latents: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ) -> tuple[torch.Tensor] | Transformer2DModelOutput:
+        prepared_inputs = self.prepare_inputs(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            block_controlnet_hidden_states=block_controlnet_hidden_states,
+            attention_mask=attention_mask,
+            fps=fps,
+            condition_mask=condition_mask,
+            padding_mask=padding_mask,
+        )
+
+        return self._forward(
+            prepared_inputs,
+            block_controlnet_hidden_states=block_controlnet_hidden_states,
+            return_dict=return_dict,
+        )
+
+    def _forward(
+        self,
+        prepared_inputs: Dict[str, Any],
+        block_controlnet_hidden_states: Optional[List[torch.Tensor]] = None,
+        return_dict: bool = True,
+    ) -> tuple[torch.Tensor] | Transformer2DModelOutput:
+        controlnet_block_index_map = {}
+        if block_controlnet_hidden_states is not None:
+            n_blocks = len(self.transformer_blocks)
+            controlnet_block_index_map = {
+                block_idx: block_controlnet_hidden_states[idx]
+                for idx, block_idx in list(enumerate(range(0, n_blocks, self.config.controlnet_block_every_n)))
+            }
+
+        p_t, p_h, p_w = self.config.patch_size
+        post_patch_num_frames = prepared_inputs["post_patch_num_frames"]
+        post_patch_height = prepared_inputs["post_patch_height"]
+        post_patch_width = prepared_inputs["post_patch_width"]
 
         # 5. Transformer blocks
-        for block in self.transformer_blocks:
+        hidden_states = prepared_inputs["hidden_states"]
+        for block_idx, block in enumerate(self.transformer_blocks):
+            controlnet_residual = controlnet_block_index_map.get(block_idx)
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
-                    encoder_hidden_states,
-                    embedded_timestep,
-                    temb,
-                    image_rotary_emb,
-                    extra_pos_emb,
-                    attention_mask,
+                    prepared_inputs["encoder_hidden_states"],
+                    prepared_inputs["embedded_timestep"],
+                    prepared_inputs["temb"],
+                    prepared_inputs["image_rotary_emb"],
+                    prepared_inputs["extra_pos_emb"],
+                    prepared_inputs["attention_mask"],
+                    controlnet_residual,
                 )
             else:
                 hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    embedded_timestep=embedded_timestep,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    extra_pos_emb=extra_pos_emb,
-                    attention_mask=attention_mask,
+                    hidden_states,
+                    prepared_inputs["encoder_hidden_states"],
+                    prepared_inputs["embedded_timestep"],
+                    prepared_inputs["temb"],
+                    prepared_inputs["image_rotary_emb"],
+                    prepared_inputs["extra_pos_emb"],
+                    prepared_inputs["attention_mask"],
+                    controlnet_residual,
                 )
+
+        temb = prepared_inputs["temb"]
+        embedded_timestep = prepared_inputs["embedded_timestep"]
 
         # 6. Output norm & projection & unpatchify
         hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)
