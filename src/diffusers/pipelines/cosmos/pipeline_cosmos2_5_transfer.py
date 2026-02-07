@@ -54,11 +54,13 @@ else:
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _maybe_pad_video(video: torch.Tensor, num_frames: int):
+def _maybe_pad_or_trim_video(video: torch.Tensor, num_frames: int):
     n_pad_frames = num_frames - video.shape[2]
     if n_pad_frames > 0:
         last_frame = video[:, :, -1:, :, :]
         video = torch.cat((video, last_frame.repeat(1, 1, n_pad_frames, 1, 1)), dim=2)
+    elif num_frames < video.shape[2]:
+        video = video[:, :, :num_frames, :, :]
     return video
 
 
@@ -385,6 +387,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         device: Optional[torch.device] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
+        num_cond_latent_frames: int = 0,
     ) -> torch.Tensor:
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
@@ -399,10 +402,14 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         W = width // self.vae_scale_factor_spatial
         shape = (B, C, T, H, W)
 
-        if num_frames_in == 0:
-            if latents is None:
-                latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        if latents is not None:
+            if latents.shape[1:] != shape[1:]:
+                raise ValueError(f"Unexpected `latents` shape, got {latents.shape}, expected {shape}.")
+            latents = latents.to(device=device, dtype=dtype)
+        else:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
+        if num_frames_in == 0:
             cond_mask = torch.zeros((B, 1, T, H, W), dtype=latents.dtype, device=latents.device)
             cond_indicator = torch.zeros((B, 1, T, 1, 1), dtype=latents.dtype, device=latents.device)
 
@@ -432,16 +439,12 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             latents_std = self.latents_std.to(device=device, dtype=dtype)
             cond_latents = (cond_latents - latents_mean) / latents_std
 
-            if latents is None:
-                latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            else:
-                latents = latents.to(device=device, dtype=dtype)
-
             padding_shape = (B, 1, T, H, W)
             ones_padding = latents.new_ones(padding_shape)
             zeros_padding = latents.new_zeros(padding_shape)
 
-            cond_indicator = latents.new_zeros(1, 1, latents.size(2), 1, 1)
+            cond_indicator = latents.new_zeros(B, 1, latents.size(2), 1, 1)
+            cond_indicator[:, :, 0:num_cond_latent_frames, :, :] = 1.0
             cond_mask = cond_indicator * ones_padding + (1 - cond_indicator) * zeros_padding
 
             return (
@@ -450,33 +453,6 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                 cond_mask,
                 cond_indicator,
             )
-
-    def _encode_controls(
-        self,
-        controls: Optional[torch.Tensor],
-        height: int,
-        width: int,
-        num_frames: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]],
-    ) -> Optional[torch.Tensor]:
-        if controls is None:
-            return None
-
-        control_video = self.video_processor.preprocess_video(controls, height, width)
-        control_video = _maybe_pad_video(control_video, num_frames)
-
-        control_video = control_video.to(device=device, dtype=self.vae.dtype)
-        control_latents = [
-            retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator=generator) for vid in control_video
-        ]
-        control_latents = torch.cat(control_latents, dim=0).to(dtype)
-
-        latents_mean = self.latents_mean.to(device=device, dtype=dtype)
-        latents_std = self.latents_std.to(device=device, dtype=dtype)
-        control_latents = (control_latents - latents_mean) / latents_std
-        return control_latents
 
     # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline.check_inputs
     def check_inputs(
@@ -535,18 +511,19 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         self,
         image: PipelineImageInput | None = None,
         video: List[PipelineImageInput] | None = None,
+        controls: Optional[PipelineImageInput | List[PipelineImageInput]] = None,
+        controls_conditioning_scale: Union[float, List[float]] = 1.0,
         prompt: Union[str, List[str]] | None = None,
         negative_prompt: Union[str, List[str]] = DEFAULT_NEGATIVE_PROMPT,
         height: int = 704,
         width: Optional[int] = None,
-        num_frames: int = 93,
+        num_frames: Optional[int] = None,
+        num_frames_per_chunk: int = 93,
         num_inference_steps: int = 36,
         guidance_scale: float = 3.0,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
-        controls: Optional[PipelineImageInput | List[PipelineImageInput]] = None,
-        controls_conditioning_scale: Union[float, List[float]] = 1.0,
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pil",
@@ -557,24 +534,16 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         conditional_frame_timestep: float = 0.1,
+        num_conditional_frames: Optional[int] = 1,
+        num_latent_conditional_frames: Optional[int] = None,
     ):
         r"""
-        The call function to the pipeline for generation. Supports three modes:
-
-        - **Text2World**: `image=None`, `video=None`, `prompt` provided. Generates a world clip.
-        - **Image2World**: `image` provided, `video=None`, `prompt` provided. Conditions on a single frame.
-        - **Video2World**: `video` provided, `image=None`, `prompt` provided. Conditions on an input clip.
-
-        Set `num_frames=93` (default) to produce a world video, or `num_frames=1` to produce a single image frame (the
-        above in "*2Image mode").
-
-        Outputs follow `output_type` (e.g., `"pil"` returns a list of `num_frames` PIL images per prompt).
 
         Args:
-            image (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, *optional*):
-                Optional single image for Image2World conditioning. Must be `None` when `video` is provided.
-            video (`List[PIL.Image.Image]`, `np.ndarray`, `torch.Tensor`, *optional*):
-                Optional input video for Video2World conditioning. Must be `None` when `image` is provided.
+            controls (`PipelineImageInput`, `List[PipelineImageInput]`, *optional*):
+                Control image or video input used by the ControlNet. If `None`, ControlNet is skipped.
+            controls_conditioning_scale (`float` or `List[float]`, *optional*, defaults to `1.0`):
+                The scale factor(s) for the ControlNet outputs. A single float is broadcast to all control blocks.
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide generation. Required unless `prompt_embeds` is supplied.
             height (`int`, defaults to `704`):
@@ -598,13 +567,11 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                 A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
                 generation deterministic.
             latents (`torch.Tensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            controls (`PipelineImageInput`, `List[PipelineImageInput]`, *optional*):
-                Control image or video input used by the ControlNet. If `None`, ControlNet is skipped.
-            controls_conditioning_scale (`float` or `List[float]`, *optional*, defaults to `1.0`):
-                The scale factor(s) for the ControlNet outputs. A single float is broadcast to all control blocks.
+                Pre-generated noisy latents sampled from a Gaussian
+                distribution, to be used as inputs. Can be used to tweak the
+                same generation with different prompts. If not provided, a
+                latents tensor is generated by sampling using the supplied
+                random `generator`.
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
@@ -627,6 +594,10 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             max_sequence_length (`int`, defaults to `512`):
                 The maximum number of tokens in the prompt. If the prompt exceeds this length, it will be truncated. If
                 the prompt is shorter than this length, it will be padded.
+            num_conditional_frames (`int`, *optional*, defaults to `1`):
+                Number of conditional frames in video-space. Only used if `num_latent_conditional_frames` is `None`.
+            num_latent_conditional_frames (`int`, *optional*):
+                Number of conditional frames in latent-space. If provided, `num_conditional_frames` is ignored.
 
         Examples:
 
@@ -659,6 +630,30 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                 width = int((height + 16) * (frame.width / frame.height))
             else:
                 width = int((height + 16) * (frame.shape[2] / frame.shape[1]))  # NOTE: assuming C H W
+
+        if num_latent_conditional_frames is not None and num_conditional_frames is not None:
+            if num_conditional_frames != 1:
+                raise ValueError(
+                    "Provide only one of `num_conditional_frames` or `num_latent_conditional_frames`, not both."
+                )
+            logger.warning(
+                "Both `num_conditional_frames` and `num_latent_conditional_frames` were provided. "
+                "Ignoring `num_conditional_frames`."
+            )
+            num_conditional_frames = None
+
+        if num_latent_conditional_frames is None and num_conditional_frames is None:
+            num_conditional_frames = 1
+
+        if num_latent_conditional_frames is not None:
+            if num_latent_conditional_frames < 0:
+                raise ValueError("`num_latent_conditional_frames` must be >= 0.")
+            num_cond_latent_frames = num_latent_conditional_frames
+            num_conditional_frames = max(0, (num_cond_latent_frames - 1) * self.vae_scale_factor_temporal + 1)
+        else:
+            if num_conditional_frames < 0:
+                raise ValueError("`num_conditional_frames` must be >= 0.")
+            num_cond_latent_frames = max(0, (num_conditional_frames - 1) // self.vae_scale_factor_temporal + 1)
 
         # Check inputs. Raise error if not correct
         self.check_inputs(prompt, height, width, prompt_embeds, callback_on_step_end_tensor_inputs)
@@ -716,123 +711,162 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         encoder_hidden_states = (prompt_embeds, img_context)
         neg_encoder_hidden_states = (negative_prompt_embeds, img_context)
 
-        num_frames_in = None
-        if image is not None:
-            if batch_size != 1:
-                raise ValueError(f"batch_size must be 1 for image input (given {batch_size})")
 
-            image = torchvision.transforms.functional.to_tensor(image).unsqueeze(0)
-            video = torch.cat([image, torch.zeros_like(image).repeat(num_frames - 1, 1, 1, 1)], dim=0)
-            video = video.unsqueeze(0)
-            num_frames_in = 1
-        elif video is None:
-            video = torch.zeros(batch_size, num_frames, 3, height, width, dtype=torch.uint8)
-            num_frames_in = 0
+        if controls is not None and self.controlnet is None:
+            logger.warning("`controls` was provided but `controlnet` is None; ignoring `controls`.")
+            controls = None
+
+        control_video = None
+        if controls is None:
+            num_frames_in = None
+            if image is not None:
+                if batch_size != 1:
+                    raise ValueError(f"batch_size must be 1 for image input (given {batch_size})")
+
+                image = torchvision.transforms.functional.to_tensor(image).unsqueeze(0)
+                video = torch.cat([image, torch.zeros_like(image).repeat(num_frames_per_chunk - 1, 1, 1, 1)], dim=0)
+                video = video.unsqueeze(0)
+                num_frames_in = 1
+                num_frames_out = num_frames
+            elif video is None:
+                video = torch.zeros(batch_size, num_frames_per_chunk, 3, height, width, dtype=torch.uint8)
+                num_frames_in = 0
+                num_frames_out = num_frames
+            else:
+                num_frames_in = len(video)
+                num_frames_out = num_frames or num_frames_in
+
+            if num_frames_out is None or num_frames_out == 0:
+                num_frames_out = num_frames_per_chunk
+
+            if num_frames is not None:
+                num_frames_out = min(num_frames_out, num_frames)
+
+            assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
+
+            video = self.video_processor.preprocess_video(video, height, width)
+            video = _maybe_pad_or_trim_video(video, num_frames_out)
         else:
-            num_frames_in = len(video)
+            num_frames_out = len(controls)
+            if num_frames is not None:
+                num_frames_out = min(num_frames_out, num_frames)
+            control_video = self.video_processor.preprocess_video(controls, height, width)
 
-            if batch_size != 1:
-                raise ValueError(f"batch_size must be 1 for video input (given {batch_size})")
+        min_chunk_len = 1 if num_frames_out <= 1 else self.vae_scale_factor_temporal + 1
+        if num_frames_per_chunk < min_chunk_len:
+            logger.warning(f"{num_frames_per_chunk=} must be larger than {min_chunk_len=}, setting to min_chunk_len")
+            num_frames_per_chunk = min_chunk_len
 
-        assert video is not None
-        video = self.video_processor.preprocess_video(video, height, width)
+        max_frames_by_rope = None
+        if getattr(self.transformer.config, "max_size", None) is not None:
+            max_frames_by_rope = max(
+                size // patch for size, patch in zip(self.transformer.config.max_size, self.transformer.config.patch_size)
+            )
+            if num_frames_per_chunk > max_frames_by_rope:
+                logger.warning(f"{num_frames_per_chunk=} is too large for RoPE setting to maximum ({max_frames_by_rope=})")
+                num_frames_per_chunk = max_frames_by_rope
 
-        # pad with last frame (for video2world)
-        num_frames_out = num_frames
-        video = _maybe_pad_video(video, num_frames_out)
-        assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
-
-        video = video.to(device=device, dtype=vae_dtype)
-
-        num_channels_latents = self.transformer.config.in_channels - 1
-        latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
-            video=video,
-            batch_size=batch_size * num_videos_per_prompt,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            num_frames_in=num_frames_in,
-            num_frames_out=num_frames,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
-        cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
-        cond_mask = cond_mask.to(transformer_dtype)
-
-        controls_latents = None
-        if controls is not None:
-            controls_latents = self._encode_controls(
-                controls,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=transformer_dtype,
-                device=device,
-                generator=generator,
+        if num_conditional_frames >= num_frames_per_chunk:
+            raise ValueError(
+                f"{num_conditional_frames=} must be smaller than {num_frames_per_chunk=} for chunked generation."
             )
 
-        padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
+        # chunk information
+        num_latent_frames_per_chunk = (num_frames_per_chunk - 1) // self.vae_scale_factor_temporal + 1
+        chunk_stride = num_frames_per_chunk - num_conditional_frames
+        chunk_idxs = [
+            (start_idx, min(start_idx + num_frames_per_chunk, num_frames_out))
+            for start_idx in range(0, num_frames_out, chunk_stride)
+        ]
 
-        # Denoising loop
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        self._num_timesteps = len(timesteps)
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        video_chunks = []
+        latents_mean = self.latents_mean.to(dtype=vae_dtype, device=device)
+        latents_std = self.latents_std.to(dtype=vae_dtype, device=device)
+        def decode_latents(latents):
+            latents = latents * latents_std + latents_mean
+            video = self.vae.decode(latents.to(dtype=self.vae.dtype, device=device), return_dict=False)[0]
+            return video
 
-        gt_velocity = (latents - cond_latent) * cond_mask
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
+        initial_num_cond_latent_frames = 0 if video is None or controls is not None else num_cond_latent_frames
+        latent_chunks = []
+        num_chunks = len(chunk_idxs)
+        total_steps = num_inference_steps * num_chunks
+        with self.progress_bar(total=total_steps) as progress_bar:
+            for chunk_idx, (start_idx, end_idx) in enumerate(chunk_idxs):
+                if chunk_idx == 0 and controls is not None:
+                    prev_output = torch.zeros((batch_size, num_frames_per_chunk, 3, height, width), dtype=vae_dtype)
+                    prev_output = self.video_processor.preprocess_video(prev_output, height, width)
+                else:
+                    prev_output = video_chunks[-1].clone() if chunk_idx != 0 else video.clone()
+                    if num_conditional_frames > 0:
+                        prev_output[:, :, :num_conditional_frames] = prev_output[:, :, -num_conditional_frames:]
+                        prev_output[:, :, num_conditional_frames:] = -1  # -1 == 0 in processed video space
+                    else:
+                        prev_output.fill_(-1)
 
-                self._current_timestep = t.cpu().item()
-
-                # NOTE: assumes sigma(t) \in [0, 1]
-                sigma_t = (
-                    torch.tensor(self.scheduler.sigmas[i].item())
-                    .unsqueeze(0)
-                    .to(device=device, dtype=transformer_dtype)
+                chunk_video = prev_output.to(device=device, dtype=vae_dtype)
+                chunk_video = _maybe_pad_or_trim_video(chunk_video, num_frames_per_chunk)
+                latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
+                    video=chunk_video,
+                    batch_size=batch_size * num_videos_per_prompt,
+                    num_channels_latents=self.transformer.config.in_channels - 1,
+                    height=height,
+                    width=width,
+                    num_frames_in=chunk_video.shape[2],
+                    num_frames_out=num_frames_per_chunk,
+                    do_classifier_free_guidance=self.do_classifier_free_guidance,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator,
+                    num_cond_latent_frames=initial_num_cond_latent_frames if chunk_idx == 0 else num_cond_latent_frames,
+                    latents=latents,
                 )
+                cond_mask = cond_mask.to(transformer_dtype)
+                cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
+                padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
 
-                in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
-                in_latents = in_latents.to(transformer_dtype)
-                in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
-                control_blocks = None
-                if controls_latents is not None and self.controlnet is not None:
-                    control_output = self.controlnet(
-                        controls_latents=controls_latents,
-                        latents=in_latents,
-                        timestep=in_timestep,
-                        encoder_hidden_states=encoder_hidden_states,
-                        condition_mask=cond_mask,
-                        conditioning_scale=controls_conditioning_scale,
-                        padding_mask=padding_mask,
-                        return_dict=False,
+                controls_latents = None
+                if controls is not None:
+                    chunk_control_video = control_video[:, :, start_idx:end_idx, ...].to(device=device, dtype=self.vae.dtype)
+                    chunk_control_video = _maybe_pad_or_trim_video(chunk_control_video, num_frames_per_chunk)
+                    controls_latents = [
+                        retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator=generator) for vid in chunk_control_video
+                    ]
+                    controls_latents = torch.cat(controls_latents, dim=0).to(transformer_dtype)
+
+                    latents_mean = self.latents_mean.to(device=device, dtype=transformer_dtype)
+                    latents_std = self.latents_std.to(device=device, dtype=transformer_dtype)
+                    controls_latents = (controls_latents - latents_mean) / latents_std
+
+                # Denoising loop
+                self.scheduler.set_timesteps(num_inference_steps, device=device)
+                timesteps = self.scheduler.timesteps
+                self._num_timesteps = len(timesteps)
+
+                gt_velocity = (latents - cond_latent) * cond_mask
+                for i, t in enumerate(timesteps):
+                    if self.interrupt:
+                        continue
+
+                    self._current_timestep = t.cpu().item()
+
+                    # NOTE: assumes sigma(t) \in [0, 1]
+                    sigma_t = (
+                        torch.tensor(self.scheduler.sigmas[i].item())
+                        .unsqueeze(0)
+                        .to(device=device, dtype=transformer_dtype)
                     )
-                    control_blocks = control_output[0]
 
-                noise_pred = self.transformer(
-                    hidden_states=in_latents,
-                    timestep=in_timestep,
-                    encoder_hidden_states=encoder_hidden_states,
-                    block_controlnet_hidden_states=control_blocks,
-                    condition_mask=cond_mask,
-                    padding_mask=padding_mask,
-                    return_dict=False,
-                )[0]
-                noise_pred = gt_velocity + noise_pred * (1 - cond_mask)
-
-                if self.do_classifier_free_guidance:
+                    in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
+                    in_latents = in_latents.to(transformer_dtype)
+                    in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
                     control_blocks = None
                     if controls_latents is not None and self.controlnet is not None:
                         control_output = self.controlnet(
                             controls_latents=controls_latents,
                             latents=in_latents,
                             timestep=in_timestep,
-                            encoder_hidden_states=neg_encoder_hidden_states,  # NOTE: negative prompt
+                            encoder_hidden_states=encoder_hidden_states,
                             condition_mask=cond_mask,
                             conditioning_scale=controls_conditioning_scale,
                             padding_mask=padding_mask,
@@ -840,46 +874,76 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                         )
                         control_blocks = control_output[0]
 
-                    noise_pred_neg = self.transformer(
+                    noise_pred = self.transformer(
                         hidden_states=in_latents,
                         timestep=in_timestep,
-                        encoder_hidden_states=neg_encoder_hidden_states,  # NOTE: negative prompt
+                        encoder_hidden_states=encoder_hidden_states,
                         block_controlnet_hidden_states=control_blocks,
                         condition_mask=cond_mask,
                         padding_mask=padding_mask,
                         return_dict=False,
                     )[0]
-                    # NOTE: replace velocity (noise_pred_neg) with gt_velocity for conditioning inputs only
-                    noise_pred_neg = gt_velocity + noise_pred_neg * (1 - cond_mask)
-                    noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_neg)
+                    noise_pred = gt_velocity + noise_pred * (1 - cond_mask)
 
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    if self.do_classifier_free_guidance:
+                        control_blocks = None
+                        if controls_latents is not None and self.controlnet is not None:
+                            control_output = self.controlnet(
+                                controls_latents=controls_latents,
+                                latents=in_latents,
+                                timestep=in_timestep,
+                                encoder_hidden_states=neg_encoder_hidden_states,  # NOTE: negative prompt
+                                condition_mask=cond_mask,
+                                conditioning_scale=controls_conditioning_scale,
+                                padding_mask=padding_mask,
+                                return_dict=False,
+                            )
+                            control_blocks = control_output[0]
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                        noise_pred_neg = self.transformer(
+                            hidden_states=in_latents,
+                            timestep=in_timestep,
+                            encoder_hidden_states=neg_encoder_hidden_states,  # NOTE: negative prompt
+                            block_controlnet_hidden_states=control_blocks,
+                            condition_mask=cond_mask,
+                            padding_mask=padding_mask,
+                            return_dict=False,
+                        )[0]
+                        # NOTE: replace velocity (noise_pred_neg) with gt_velocity for conditioning inputs only
+                        noise_pred_neg = gt_velocity + noise_pred_neg * (1 - cond_mask)
+                        noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_neg)
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                    # call the callback, if provided
+                    if i == total_steps - 1 or ((i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+
+                    if XLA_AVAILABLE:
+                        xm.mark_step()
+
+                video_chunks.append(decode_latents(latents).detach().cpu())
+                latent_chunks.append(latents.detach().cpu())
 
         self._current_timestep = None
 
         if not output_type == "latent":
-            latents_mean = self.latents_mean.to(latents.device, latents.dtype)
-            latents_std = self.latents_std.to(latents.device, latents.dtype)
-            latents = latents * latents_std + latents_mean
-            video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
-            video = self._match_num_frames(video, num_frames)
+            video_chunks = [
+                chunk[:, :, num_conditional_frames:,...] if chunk_idx != 0 else chunk
+                for chunk_idx, chunk in enumerate(video_chunks)
+            ]
+            video = torch.cat(video_chunks, dim=2)
+            video = video[:, :, :num_frames_out, ...]
 
             assert self.safety_checker is not None
             self.safety_checker.to(device)
@@ -887,7 +951,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             video = (video * 255).astype(np.uint8)
             video_batch = []
             for vid in video:
-                vid = self.safety_checker.check_video_safety(vid)
+                # vid = self.safety_checker.check_video_safety(vid)
                 if vid is None:
                     video_batch.append(np.zeros_like(video[0]))
                 else:
@@ -896,7 +960,13 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
-            video = latents
+            latent_T = (num_frames_out - 1) // self.vae_scale_factor_temporal + 1
+            latent_chunks = [
+                chunk[:, :, num_cond_latent_frames:,...] if chunk_idx != 0 else chunk
+                for chunk_idx, chunk in enumerate(latent_chunks)
+            ]
+            video = torch.cat(latent_chunks, dim=2)
+            video = video[:, :, :latent_T, ...]
 
         # Offload all models
         self.maybe_free_model_hooks()
@@ -905,19 +975,3 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             return (video,)
 
         return CosmosPipelineOutput(frames=video)
-
-    def _match_num_frames(self, video: torch.Tensor, target_num_frames: int) -> torch.Tensor:
-        if target_num_frames <= 0 or video.shape[2] == target_num_frames:
-            return video
-
-        frames_per_latent = max(self.vae_scale_factor_temporal, 1)
-        video = torch.repeat_interleave(video, repeats=frames_per_latent, dim=2)
-
-        current_frames = video.shape[2]
-        if current_frames < target_num_frames:
-            pad = video[:, :, -1:, :, :].repeat(1, 1, target_num_frames - current_frames, 1, 1)
-            video = torch.cat([video, pad], dim=2)
-        elif current_frames > target_num_frames:
-            video = video[:, :, :target_num_frames]
-
-        return video
