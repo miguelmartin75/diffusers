@@ -844,7 +844,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     num_cond_latent_frames=initial_num_cond_latent_frames
                     if chunk_idx == 0
                     else num_cond_latent_frames,
-                    latents=latents,
+                    # latents=latents,
                 )
                 cond_mask = cond_mask.to(transformer_dtype)
                 cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
@@ -866,6 +866,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     latents_std = self.latents_std.to(device=device, dtype=transformer_dtype)
                     controls_latents = (controls_latents - latents_mean) / latents_std
 
+                # breakpoint()
                 # Denoising loop
                 self.scheduler.set_timesteps(num_inference_steps, device=device)
                 timesteps = self.scheduler.timesteps
