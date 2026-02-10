@@ -521,7 +521,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         num_frames_per_chunk: int = 93,
         num_inference_steps: int = 36,
         guidance_scale: float = 3.0,
-        num_videos_per_prompt: Optional[int] = 1,
+        num_videos_per_prompt: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -721,15 +721,23 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         vae_dtype = self.vae.dtype
         transformer_dtype = self.transformer.dtype
 
-        img_context = torch.zeros(
-            batch_size,
-            self.transformer.config.img_context_num_tokens,
-            self.transformer.config.img_context_dim_in,
-            device=prompt_embeds.device,
-            dtype=transformer_dtype,
-        )
-        encoder_hidden_states = (prompt_embeds, img_context)
-        neg_encoder_hidden_states = (negative_prompt_embeds, img_context)
+        if getattr(self.transformer.config, "img_context_dim_in", None):
+            img_context = torch.zeros(
+                batch_size,
+                self.transformer.config.img_context_num_tokens,
+                self.transformer.config.img_context_dim_in,
+                device=prompt_embeds.device,
+                dtype=transformer_dtype,
+            )
+
+            if num_videos_per_prompt > 1:
+                img_context = img_context.repeat_interleave(num_videos_per_prompt, dim=0)
+
+            encoder_hidden_states = (prompt_embeds, img_context)
+            neg_encoder_hidden_states = (negative_prompt_embeds, img_context)
+        else:
+            encoder_hidden_states = prompt_embeds
+            neg_encoder_hidden_states = negative_prompt_embeds
 
         if controls is not None and self.controlnet is None:
             logger.warning("`controls` was provided but `controlnet` is None; ignoring `controls`.")
@@ -798,7 +806,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         chunk_stride = num_frames_per_chunk - num_conditional_frames
         chunk_idxs = [
             (start_idx, min(start_idx + num_frames_per_chunk, num_frames_out))
-            for start_idx in range(0, num_frames_out, chunk_stride)
+            for start_idx in range(0, num_frames_out - num_conditional_frames, chunk_stride)
         ]
 
         video_chunks = []
@@ -810,6 +818,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             video = self.vae.decode(latents.to(dtype=self.vae.dtype, device=device), return_dict=False)[0]
             return video
 
+        latents_arg = latents
         initial_num_cond_latent_frames = 0 if video is None or controls is not None else num_cond_latent_frames
         latent_chunks = []
         num_chunks = len(chunk_idxs)
@@ -844,7 +853,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     num_cond_latent_frames=initial_num_cond_latent_frames
                     if chunk_idx == 0
                     else num_cond_latent_frames,
-                    # latents=latents,
+                    latents=latents_arg,
                 )
                 cond_mask = cond_mask.to(transformer_dtype)
                 cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
@@ -866,7 +875,6 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     latents_std = self.latents_std.to(device=device, dtype=transformer_dtype)
                     controls_latents = (controls_latents - latents_mean) / latents_std
 
-                # breakpoint()
                 # Denoising loop
                 self.scheduler.set_timesteps(num_inference_steps, device=device)
                 timesteps = self.scheduler.timesteps
@@ -980,7 +988,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             video = (video * 255).astype(np.uint8)
             video_batch = []
             for vid in video:
-                # vid = self.safety_checker.check_video_safety(vid)
+                vid = self.safety_checker.check_video_safety(vid)
                 if vid is None:
                     video_batch.append(np.zeros_like(video[0]))
                 else:
