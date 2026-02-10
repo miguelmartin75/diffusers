@@ -151,7 +151,7 @@ EXAMPLE_DOC_STRING = """
 
 class Cosmos2_5_TransferPipeline(DiffusionPipeline):
     r"""
-    Pipeline for Cosmos Transfer2.5 base model.
+    Pipeline for Cosmos Transfer2.5, supporting auto-regressive inference.
 
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
     implemented for all pipelines (downloading, saving, running on a particular device, etc.).
@@ -538,18 +538,25 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         num_latent_conditional_frames: Optional[int] = None,
     ):
         r"""
-        The call function supports a predict-compatible path when `controls` is `None` (or `self.controlnet` is
-        `None`). In that mode it follows the same input semantics as `Cosmos2_5_PredictPipeline`:
+        The call function can be used in two modes: with or without controls.
 
+        When controls are not provided (`controls is None`), inference works in the same manner as predict2.5 (see
+        `Cosmos2_5_PredictPipeline`). This mode strictly uses the base transformer (`self.transformer`) to perform
+        inference and accepts as input an optional `image` or `video` along with a `prompt` / `negative_prompt`, and
+        can be used in the following ways:
         - **Text2World**: `image=None`, `video=None`, `prompt` provided.
         - **Image2World**: `image` provided, `video=None`, `prompt` provided.
         - **Video2World**: `video` provided, `image=None`, `prompt` provided.
 
         When `controls` are provided and a ControlNet is attached, `controls` drive the conditioning and `video` &
-        `image` is ignored.
+        `image` is ignored. Controls are assumed to be pre-processed, e.g. edge maps are pre-computed.
 
         Setting `num_frames` will restrict the total number of frames output, if not provided or assigned to None
         (default) then the number of output frames will match the input `video`, `image` or `controls` respectively.
+        Auto-regressive inference is supported and thus a sliding window of `num_frames_per_chunk` frames are used per
+        denoising loop. In addition, when auto-regressive inference is performed, the previous
+        `num_latent_conditional_frames` or `num_conditional_frames` are used to condition the following denoising
+        inference loops.
 
         Args:
             image (`PipelineImageInput`, *optional*):
