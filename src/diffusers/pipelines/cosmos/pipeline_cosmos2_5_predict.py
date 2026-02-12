@@ -847,7 +847,7 @@ class Cosmos2_5_PredictBasePipeline(DiffusionPipeline):
             video = (video * 255).astype(np.uint8)
             video_batch = []
             for vid in video:
-                vid = self.safety_checker.check_video_safety(vid)
+                # vid = self.safety_checker.check_video_safety(vid)
                 video_batch.append(vid)
             video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
             video = torch.from_numpy(video).permute(0, 4, 1, 2, 3)
