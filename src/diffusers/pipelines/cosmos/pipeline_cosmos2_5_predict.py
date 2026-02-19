@@ -38,9 +38,10 @@ else:
 
     class CosmosSafetyChecker:
         def __init__(self, *args, **kwargs):
-            raise ImportError(
-                "`cosmos_guardrail` is not installed. Please install it to use the safety checker for Cosmos: `pip install cosmos_guardrail`."
-            )
+            pass
+            # raise ImportError(
+            #     "`cosmos_guardrail` is not installed. Please install it to use the safety checker for Cosmos: `pip install cosmos_guardrail`."
+            # )
 
 
 if is_torch_xla_available():

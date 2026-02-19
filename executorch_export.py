@@ -1,5 +1,10 @@
 """
+uv venv
+source .venv/bin/activate
+uv pip install executorch -e '.[dev]' 
+
 Example:
+
 python executorch_export.py \
   --model-id nvidia/Cosmos-Predict2.5-2B \
   --revision diffusers/base/post-trained \
@@ -9,17 +14,17 @@ Reference:
 https://docs.pytorch.org/executorch/stable/using-executorch-export.html
 """
 
-from __future__ import annotations
+# from __future__ import annotations # NOTE bug for msup (to patch) field is not resolved into a type
 
-import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from torch.export import Dim, export
 
 from diffusers import Cosmos2_5_PredictBasePipeline
+from msup.cli import cli
 
 
 @dataclass
@@ -34,6 +39,8 @@ class ExportModelArgs:
     text_seq_len: int = 512
     use_dynamic_shapes: bool = False
     use_xnnpack: bool = True
+    run_after_export: bool = True
+    compare_original: bool = False
 
 
 class ExportableCosmosTransformer(torch.nn.Module):
@@ -89,6 +96,89 @@ def _build_example_inputs(
 
     return hidden_states, timestep, encoder_hidden_states, condition_mask, padding_mask
 
+def run_executorch_model(
+    output_path: Path,
+    example_inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> List[torch.Tensor]:
+    from executorch.runtime import Runtime
+
+    runtime = Runtime.get()
+    program = runtime.load_program(str(output_path))
+    try:
+        method = program.load_method("forward")
+    except RuntimeError as error:
+        error_message = str(error)
+        if "XnnpackBackend" in error_message or "Failed to load method forward" in error_message:
+            raise RuntimeError(
+                "Failed to load ExecuTorch method `forward`. "
+                "The exported model likely uses XNNPACK delegation that is not supported in this runtime. "
+                "Re-export with `use_xnnpack=false` and try again."
+            ) from error
+        raise
+    return method.execute(list(example_inputs))
+
+
+def _run_and_compare_with_eager(
+    eager_reference_model: torch.nn.Module,
+    output_path: Path,
+    example_inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> bool:
+    with torch.no_grad():
+        eager_output = eager_reference_model(*example_inputs)
+
+    executorch_output = run_executorch_model(output_path, example_inputs)
+    is_close = torch.allclose(executorch_output[0], eager_output, rtol=1e-3, atol=1e-5)
+    print("Run successfully via executorch runtime")
+    print("Comparing against original PyTorch module")
+    print(is_close)
+    return bool(is_close)
+
+
+def _torch_dtype_from_scalar_type_code(scalar_type_code: int) -> torch.dtype:
+    # c10::ScalarType enum values used by ExecuTorch TensorInfo.dtype()
+    mapping = {
+        0: torch.uint8,
+        1: torch.int8,
+        2: torch.int16,
+        3: torch.int32,
+        4: torch.int64,
+        5: torch.float16,
+        6: torch.float32,
+        7: torch.float64,
+        11: torch.bool,
+        15: torch.bfloat16,
+    }
+    if scalar_type_code not in mapping:
+        raise ValueError(f"Unsupported ExecuTorch scalar type code: {scalar_type_code}")
+    return mapping[scalar_type_code]
+
+
+def _make_tensor_from_tensor_info(tensor_info: Any) -> torch.Tensor:
+    shape = tuple(int(dim) for dim in tensor_info.sizes())
+    dtype = _torch_dtype_from_scalar_type_code(int(tensor_info.dtype()))
+    if dtype in {torch.float16, torch.float32, torch.float64, torch.bfloat16}:
+        return torch.randn(shape, dtype=dtype)
+    return torch.zeros(shape, dtype=dtype)
+
+
+def _build_example_inputs_from_export(
+    output_path: Path,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from executorch.runtime import Runtime
+
+    runtime = Runtime.get()
+    program = runtime.load_program(str(output_path))
+    method_meta = program.metadata("forward")
+
+    if method_meta.num_inputs() != 5:
+        raise ValueError(f"Expected 5 inputs for `forward`, got {method_meta.num_inputs()}")
+
+    inputs = tuple(
+        _make_tensor_from_tensor_info(method_meta.input_tensor_meta(index))
+        for index in range(method_meta.num_inputs())
+    )
+    return inputs  # type: ignore[return-value]
+
 
 def _build_dynamic_shapes(transformer: torch.nn.Module, args: ExportModelArgs) -> Dict[str, Any]:
     max_size = getattr(transformer.config, "max_size", (args.num_frames, args.height, args.width))
@@ -107,7 +197,9 @@ def _build_dynamic_shapes(transformer: torch.nn.Module, args: ExportModelArgs) -
     }
 
 
-def export_model(args: ExportModelArgs) -> Path:
+def export_model(
+    args: ExportModelArgs,
+):
     from executorch.exir import to_edge_transform_and_lower
 
     pipe = Cosmos2_5_PredictBasePipeline.from_pretrained(
@@ -145,41 +237,47 @@ def export_model(args: ExportModelArgs) -> Path:
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(executorch_program.buffer)
-    return output_path
-
-
-def _parse_args() -> ExportModelArgs:
-    parser = argparse.ArgumentParser(description="Export Cosmos transformer to ExecuTorch (.pte).")
-    parser.add_argument("--model-id", default=ExportModelArgs.model_id)
-    parser.add_argument("--revision", default=ExportModelArgs.revision)
-    parser.add_argument("--output-path", default=ExportModelArgs.output_path)
-    parser.add_argument("--batch-size", type=int, default=ExportModelArgs.batch_size)
-    parser.add_argument("--num-frames", type=int, default=ExportModelArgs.num_frames)
-    parser.add_argument("--height", type=int, default=ExportModelArgs.height)
-    parser.add_argument("--width", type=int, default=ExportModelArgs.width)
-    parser.add_argument("--text-seq-len", type=int, default=ExportModelArgs.text_seq_len)
-    parser.add_argument("--dynamic-shapes", action="store_true")
-    parser.add_argument("--disable-xnnpack", action="store_true")
-    parsed = parser.parse_args()
-
-    return ExportModelArgs(
-        model_id=parsed.model_id,
-        revision=parsed.revision,
-        output_path=parsed.output_path,
-        batch_size=parsed.batch_size,
-        num_frames=parsed.num_frames,
-        height=parsed.height,
-        width=parsed.width,
-        text_seq_len=parsed.text_seq_len,
-        use_dynamic_shapes=parsed.dynamic_shapes,
-        use_xnnpack=not parsed.disable_xnnpack,
-    )
-
-
-def main() -> None:
-    output_path = export_model(_parse_args())
     print(f"Exported ExecuTorch model to {output_path}")
 
+    if args.run_after_export:
+        _run_and_compare_with_eager(
+            eager_reference_model=wrapped_model,
+            output_path=output_path,
+            example_inputs=example_inputs,
+        )
+
+
+def test_model(args: ExportModelArgs):
+    output_path = Path(args.output_path)
+    if not output_path.exists():
+        raise FileNotFoundError(
+            f"ExecuTorch model not found at {output_path}. Run `export_model` first."
+        )
+
+    example_inputs = _build_example_inputs_from_export(output_path)
+    output = run_executorch_model(output_path, example_inputs)
+    print("Run successfully via executorch runtime")
+    print(f"Num outputs: {len(output)}")
+    if output:
+        print(f"Output[0] shape: {tuple(output[0].shape)}")
+        print(f"Output[0] dtype: {output[0].dtype}")
+
+    if args.compare_original:
+        pipe = Cosmos2_5_PredictBasePipeline.from_pretrained(
+            args.model_id, revision=args.revision, torch_dtype=torch.float32
+        )
+        transformer = pipe.transformer.to(device="cpu", dtype=torch.float32).eval()
+        del pipe
+
+        wrapped_model = ExportableCosmosTransformer(transformer).eval()
+        _run_and_compare_with_eager(
+            eager_reference_model=wrapped_model,
+            output_path=output_path,
+            example_inputs=example_inputs,
+        )
 
 if __name__ == "__main__":
-    main()
+    cli({
+        export_model: "exports a model",
+        test_model: "tests a model that has been exported"
+    })
