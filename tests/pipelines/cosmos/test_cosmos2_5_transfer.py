@@ -226,7 +226,7 @@ class Cosmos2_5_TransferPipelineFastTests(PipelineTesterMixin, unittest.TestCase
         inputs = self.get_dummy_inputs(device)
         inputs["num_frames"] = 5
         inputs["num_frames_per_chunk"] = 3
-        inputs["num_conditional_frames"] = 1
+        inputs["num_ar_conditional_frames"] = 1
 
         video = pipe(**inputs).frames
         generated_video = video[0]
@@ -244,7 +244,7 @@ class Cosmos2_5_TransferPipelineFastTests(PipelineTesterMixin, unittest.TestCase
         inputs = self.get_dummy_inputs(device)
         inputs["num_frames"] = 5
         inputs["num_frames_per_chunk"] = 3
-        inputs["num_conditional_frames"] = 0
+        inputs["num_ar_conditional_frames"] = 0
 
         video = pipe(**inputs).frames
         generated_video = video[0]

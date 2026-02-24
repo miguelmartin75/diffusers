@@ -464,6 +464,8 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         width,
         prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
+        num_ar_conditional_frames=None,
+        num_ar_latent_conditional_frames=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -486,6 +488,17 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             )
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+
+        if num_ar_latent_conditional_frames is not None and num_ar_conditional_frames is not None:
+            raise ValueError(
+                "Provide only one of `num_ar_conditional_frames` or `num_ar_latent_conditional_frames`, not both."
+            )
+        if num_ar_latent_conditional_frames is None and num_ar_conditional_frames is None:
+            raise ValueError("Provide either `num_ar_conditional_frames` or `num_ar_latent_conditional_frames`.")
+        if num_ar_latent_conditional_frames is not None and num_ar_latent_conditional_frames < 0:
+            raise ValueError("`num_ar_latent_conditional_frames` must be >= 0.")
+        if num_ar_conditional_frames is not None and num_ar_conditional_frames < 0:
+            raise ValueError("`num_ar_conditional_frames` must be >= 0.")
 
     @property
     def guidance_scale(self):
@@ -534,8 +547,8 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         conditional_frame_timestep: float = 0.1,
-        num_conditional_frames: Optional[int] = 1,
-        num_latent_conditional_frames: Optional[int] = None,
+        num_ar_conditional_frames: Optional[int] = 1,
+        num_ar_latent_conditional_frames: Optional[int] = None,
     ):
         r"""
         `controls` drive the conditioning through ControlNet. Controls are assumed to be pre-processed, e.g. edge maps
@@ -546,7 +559,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
 
         Auto-regressive inference is supported and thus a sliding window of `num_frames_per_chunk` frames are used per
         denoising loop. In addition, when auto-regressive inference is performed, the previous
-        `num_latent_conditional_frames` or `num_conditional_frames` are used to condition the following denoising
+        `num_ar_latent_conditional_frames` or `num_ar_conditional_frames` are used to condition the following denoising
         inference loops.
 
         Args:
@@ -603,11 +616,18 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             max_sequence_length (`int`, defaults to `512`):
                 The maximum number of tokens in the prompt. If the prompt exceeds this length, it will be truncated. If
                 the prompt is shorter than this length, it will be padded.
-            num_conditional_frames (`int`, *optional*, defaults to `1`):
-                Number of conditional frames in video-space. Only used if `num_latent_conditional_frames` is `None`.
-            num_latent_conditional_frames (`int`, *optional*):
-                Number of conditional frames in latent-space. If provided, `num_conditional_frames` is ignored.
+            num_ar_conditional_frames (`int`, *optional*, defaults to `1`):
+                Number of frames to condition on subsequent inference loops in auto-regressive inference, i.e. for the
+                second chunk and onwards. Only used if `num_ar_latent_conditional_frames` is `None`.
 
+                This is only used when auto-regressive inference is performed, i.e. when the number of frames in
+                controls is > num_frames_per_chunk
+            num_ar_latent_conditional_frames (`int`, *optional*):
+                Number of latent frames to condition on subsequent inference loops in auto-regressive inference, i.e.
+                for the second chunk and onwards. Only used if `num_ar_conditional_frames` is `None`.
+
+                This is only used when auto-regressive inference is performed, i.e. when the number of frames in
+                controls is > num_frames_per_chunk
         Examples:
 
         Returns:
@@ -643,36 +663,22 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     raise ValueError("`controls` must contain 3D frames in CHW format.")
                 width = int((height + 16) * (frame.shape[2] / frame.shape[1]))  # NOTE: assuming C H W
 
-        if num_latent_conditional_frames is not None and num_conditional_frames is not None:
-            if num_conditional_frames != 1:
-                raise ValueError(
-                    "Provide only one of `num_conditional_frames` or `num_latent_conditional_frames`, not both."
-                )
-            logger.warning(
-                "Both `num_conditional_frames` and `num_latent_conditional_frames` were provided. "
-                "Ignoring `num_conditional_frames`."
-            )
-            num_conditional_frames = None
-
-        if num_latent_conditional_frames is None and num_conditional_frames is None:
-            logger.warning(
-                "Neither `num_conditional_frames` and `num_latent_conditional_frames` were provided. "
-                "Setting `num_conditional_frames` to 1."
-            )
-            num_conditional_frames = 1
-
-        if num_latent_conditional_frames is not None:
-            if num_latent_conditional_frames < 0:
-                raise ValueError("`num_latent_conditional_frames` must be >= 0.")
-            num_cond_latent_frames = num_latent_conditional_frames
-            num_conditional_frames = max(0, (num_cond_latent_frames - 1) * self.vae_scale_factor_temporal + 1)
-        else:
-            if num_conditional_frames < 0:
-                raise ValueError("`num_conditional_frames` must be >= 0.")
-            num_cond_latent_frames = max(0, (num_conditional_frames - 1) // self.vae_scale_factor_temporal + 1)
-
         # Check inputs. Raise error if not correct
-        self.check_inputs(prompt, height, width, prompt_embeds, callback_on_step_end_tensor_inputs)
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            prompt_embeds,
+            callback_on_step_end_tensor_inputs,
+            num_ar_conditional_frames,
+            num_ar_latent_conditional_frames,
+        )
+
+        if num_ar_latent_conditional_frames is not None:
+            num_cond_latent_frames = num_ar_latent_conditional_frames
+            num_ar_conditional_frames = max(0, (num_cond_latent_frames - 1) * self.vae_scale_factor_temporal + 1)
+        else:
+            num_cond_latent_frames = max(0, (num_ar_conditional_frames - 1) // self.vae_scale_factor_temporal + 1)
 
         self._guidance_scale = guidance_scale
         self._current_timestep = None
@@ -747,12 +753,10 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         num_frames_out = control_video.shape[2]
         if num_frames is not None:
             num_frames_out = min(num_frames_out, num_frames)
-        if num_frames_out == 0:
-            num_frames_out = num_frames_per_chunk
 
         control_video = _maybe_pad_or_trim_video(control_video, num_frames_out)
 
-        min_chunk_len = 1 if num_frames_out <= 1 else self.vae_scale_factor_temporal + 1
+        min_chunk_len = self.vae_scale_factor_temporal + 1
         if num_frames_per_chunk < min_chunk_len:
             logger.warning(f"{num_frames_per_chunk=} must be larger than {min_chunk_len=}, setting to min_chunk_len")
             num_frames_per_chunk = min_chunk_len
@@ -769,17 +773,17 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                 )
                 num_frames_per_chunk = max_frames_by_rope
 
-        if num_conditional_frames >= num_frames_per_chunk:
+        if num_ar_conditional_frames >= num_frames_per_chunk:
             raise ValueError(
-                f"{num_conditional_frames=} must be smaller than {num_frames_per_chunk=} for chunked generation."
+                f"{num_ar_conditional_frames=} must be smaller than {num_frames_per_chunk=} for chunked generation."
             )
 
         # chunk information
         num_latent_frames_per_chunk = (num_frames_per_chunk - 1) // self.vae_scale_factor_temporal + 1
-        chunk_stride = num_frames_per_chunk - num_conditional_frames
+        chunk_stride = num_frames_per_chunk - num_ar_conditional_frames
         chunk_idxs = [
             (start_idx, min(start_idx + num_frames_per_chunk, num_frames_out))
-            for start_idx in range(0, num_frames_out - num_conditional_frames, chunk_stride)
+            for start_idx in range(0, num_frames_out - num_ar_conditional_frames, chunk_stride)
         ]
 
         video_chunks = []
@@ -803,9 +807,9 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     prev_output = self.video_processor.preprocess_video(prev_output, height, width)
                 else:
                     prev_output = video_chunks[-1].clone()
-                    if num_conditional_frames > 0:
-                        prev_output[:, :, :num_conditional_frames] = prev_output[:, :, -num_conditional_frames:]
-                        prev_output[:, :, num_conditional_frames:] = -1  # -1 == 0 in processed video space
+                    if num_ar_conditional_frames > 0:
+                        prev_output[:, :, :num_ar_conditional_frames] = prev_output[:, :, -num_ar_conditional_frames:]
+                        prev_output[:, :, num_ar_conditional_frames:] = -1  # -1 == 0 in processed video space
                     else:
                         prev_output.fill_(-1)
 
@@ -949,7 +953,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
 
         if not output_type == "latent":
             video_chunks = [
-                chunk[:, :, num_conditional_frames:, ...] if chunk_idx != 0 else chunk
+                chunk[:, :, num_ar_conditional_frames:, ...] if chunk_idx != 0 else chunk
                 for chunk_idx, chunk in enumerate(video_chunks)
             ]
             video = torch.cat(video_chunks, dim=2)
