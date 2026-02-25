@@ -188,6 +188,7 @@ class Cosmos2_5_TransferPipelineFastTests(PipelineTesterMixin, unittest.TestCase
             "height": 32,
             "width": 32,
             "num_frames": 3,
+            "num_frames_per_chunk": 16,
             "max_sequence_length": 16,
             "output_type": "pt",
         }
@@ -250,6 +251,20 @@ class Cosmos2_5_TransferPipelineFastTests(PipelineTesterMixin, unittest.TestCase
         generated_video = video[0]
         self.assertEqual(generated_video.shape, (5, 3, 32, 32))
         self.assertTrue(torch.isfinite(generated_video).all())
+
+    def test_num_frames_per_chunk_above_rope_raises(self):
+        device = "cpu"
+
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+        pipe.to(device)
+        pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        inputs["num_frames_per_chunk"] = 17
+
+        with self.assertRaisesRegex(ValueError, "too large for RoPE setting"):
+            pipe(**inputs)
 
     def test_inference_with_controls(self):
         """Test inference with control inputs (ControlNet)."""

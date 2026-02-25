@@ -456,7 +456,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                 cond_indicator,
             )
 
-    # Copied from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline.check_inputs
+    # Modified from diffusers.pipelines.cosmos.pipeline_cosmos_text2world.CosmosTextToWorldPipeline.check_inputs
     def check_inputs(
         self,
         prompt,
@@ -466,9 +466,23 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs=None,
         num_ar_conditional_frames=None,
         num_ar_latent_conditional_frames=None,
+        num_frames_per_chunk=None,
+        num_frames=None,
+        conditional_frame_timestep=0.1,
     ):
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
+        if width <= 0 or height <= 0 or height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`height` and `width` have to be divisible by 16 (& positive) but are {height} and {width}."
+            )
+
+        if num_frames is not None and num_frames <= 0:
+            raise ValueError(f"`num_frames` has to be a positive integer when provided but is {num_frames}.")
+
+        if conditional_frame_timestep < 0 or conditional_frame_timestep > 1:
+            raise ValueError(
+                "`conditional_frame_timestep` has to be a float in the [0, 1] interval but is "
+                f"{conditional_frame_timestep}."
+            )
 
         if callback_on_step_end_tensor_inputs is not None and not all(
             k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
@@ -499,6 +513,35 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             raise ValueError("`num_ar_latent_conditional_frames` must be >= 0.")
         if num_ar_conditional_frames is not None and num_ar_conditional_frames < 0:
             raise ValueError("`num_ar_conditional_frames` must be >= 0.")
+
+        if num_ar_latent_conditional_frames is not None:
+            num_ar_conditional_frames = max(
+                0, (num_ar_latent_conditional_frames - 1) * self.vae_scale_factor_temporal + 1
+            )
+
+        min_chunk_len = self.vae_scale_factor_temporal + 1
+        if num_frames_per_chunk < min_chunk_len:
+            logger.warning(f"{num_frames_per_chunk=} must be larger than {min_chunk_len=}, setting to min_chunk_len")
+            num_frames_per_chunk = min_chunk_len
+
+        max_frames_by_rope = None
+        if getattr(self.transformer.config, "max_size", None) is not None:
+            max_frames_by_rope = max(
+                size // patch
+                for size, patch in zip(self.transformer.config.max_size, self.transformer.config.patch_size)
+            )
+            if num_frames_per_chunk > max_frames_by_rope:
+                raise ValueError(
+                    f"{num_frames_per_chunk=} is too large for RoPE setting ({max_frames_by_rope=}). "
+                    "Please reduce `num_frames_per_chunk`."
+                )
+
+        if num_ar_conditional_frames >= num_frames_per_chunk:
+            raise ValueError(
+                f"{num_ar_conditional_frames=} must be smaller than {num_frames_per_chunk=} for chunked generation."
+            )
+
+        return num_frames_per_chunk
 
     @property
     def guidance_scale(self):
@@ -663,8 +706,7 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     raise ValueError("`controls` must contain 3D frames in CHW format.")
                 width = int((height + 16) * (frame.shape[2] / frame.shape[1]))  # NOTE: assuming C H W
 
-        # Check inputs. Raise error if not correct
-        self.check_inputs(
+        num_frames_per_chunk = self.check_inputs(
             prompt,
             height,
             width,
@@ -672,6 +714,9 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
             callback_on_step_end_tensor_inputs,
             num_ar_conditional_frames,
             num_ar_latent_conditional_frames,
+            num_frames_per_chunk,
+            num_frames,
+            conditional_frame_timestep,
         )
 
         if num_ar_latent_conditional_frames is not None:
@@ -756,28 +801,6 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
 
         control_video = _maybe_pad_or_trim_video(control_video, num_frames_out)
 
-        min_chunk_len = self.vae_scale_factor_temporal + 1
-        if num_frames_per_chunk < min_chunk_len:
-            logger.warning(f"{num_frames_per_chunk=} must be larger than {min_chunk_len=}, setting to min_chunk_len")
-            num_frames_per_chunk = min_chunk_len
-
-        max_frames_by_rope = None
-        if getattr(self.transformer.config, "max_size", None) is not None:
-            max_frames_by_rope = max(
-                size // patch
-                for size, patch in zip(self.transformer.config.max_size, self.transformer.config.patch_size)
-            )
-            if num_frames_per_chunk > max_frames_by_rope:
-                logger.warning(
-                    f"{num_frames_per_chunk=} is too large for RoPE setting to maximum ({max_frames_by_rope=})"
-                )
-                num_frames_per_chunk = max_frames_by_rope
-
-        if num_ar_conditional_frames >= num_frames_per_chunk:
-            raise ValueError(
-                f"{num_ar_conditional_frames=} must be smaller than {num_frames_per_chunk=} for chunked generation."
-            )
-
         # chunk information
         num_latent_frames_per_chunk = (num_frames_per_chunk - 1) // self.vae_scale_factor_temporal + 1
         chunk_stride = num_frames_per_chunk - num_ar_conditional_frames
@@ -852,8 +875,6 @@ class Cosmos2_5_TransferPipeline(DiffusionPipeline):
                     ]
                 controls_latents = torch.cat(controls_latents, dim=0).to(transformer_dtype)
 
-                latents_mean = self.latents_mean.to(device=device, dtype=transformer_dtype)
-                latents_std = self.latents_std.to(device=device, dtype=transformer_dtype)
                 controls_latents = (controls_latents - latents_mean) / latents_std
 
                 # Denoising loop
